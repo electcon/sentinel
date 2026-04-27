@@ -86,6 +86,7 @@ function adminPage(title, body) {
   <a href="/admin/threats">threats</a>
   <a href="/admin/classifier-quality">classifier</a>
   <a href="/admin/telegram-channels">telegram</a>
+  <a href="/admin/audit">audit</a>
 </div>
 <div class="container">
 ${body}
@@ -99,6 +100,23 @@ function build(pool) {
   function gate(req, res, next) {
     if (!basicAuthGate(req, res)) return;
     next();
+  }
+
+  // Best-effort audit-log writer. Failures are silent — audit log is
+  // useful but not load-bearing.
+  async function audit(req, action, { targetType = null, targetId = null, details = null } = {}) {
+    try {
+      const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+      // Operator identity: Basic-auth username (always 'admin' or '' since we
+      // only check the password). For now actor is constant 'admin'; future
+      // multi-operator setup would parse this from the Basic auth header.
+      await pool.query(`
+        INSERT INTO operator_audit (actor, action, target_type, target_id, details, ip)
+        VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+      `, ['admin', action, targetType, targetId, details ? JSON.stringify(details) : null, ip || null]);
+    } catch (e) {
+      console.error('[audit] write failed:', e.message);
+    }
   }
 
   // ── /admin overview ───────────────────────────────────────────────
@@ -485,6 +503,11 @@ function build(pool) {
         welcomeNote = ' (Welcome email skipped — customer existed; only re-send via CLI to avoid resend on every update.)';
       }
 
+      await audit(req, existing.rowCount > 0 ? 'update' : 'provision', {
+        targetType: 'customer',
+        targetId: customerId,
+        details: { name, contact_email, alert_email, digest_email, status: useStatus, state: useState, targets_added: created, targets_updated: updated, welcome_emailed: req.body.send_welcome === '1' && existing.rowCount === 0 }
+      });
       const note = `${existing.rowCount > 0 ? 'updated' : 'created'} customer; ${created} new + ${updated} updated targets.${welcomeNote}`;
       res.redirect(`/admin/customers/${customerId}?ok=` + encodeURIComponent(note));
     } catch (e) {
@@ -728,12 +751,12 @@ function build(pool) {
       `, [cid, e.category || null, e.label || null, e.notes || null, e.citation || null, e.est_subscribers || null]);
       if (r2.rows[0].inserted_new) added++; else updated++;
     }
+    await audit(req, 'bulk_add', { targetType: 'monitored_channel', details: { source: 'telegram', added, updated, skipped, total_input: entries.length } });
     res.redirect(`/admin/telegram-channels?ok=${encodeURIComponent(`Added ${added}, updated ${updated}${skipped ? `, skipped ${skipped}` : ''}`)}`);
   });
 
   r.post('/admin/telegram-channels/:id/toggle', gate, express.urlencoded({ extended: false }), async (req, res) => {
-    // Resuming a channel (active flips to TRUE) also clears auto-pause
-    // counters so it doesn't immediately re-pause on the next tick.
+    const before = await pool.query(`SELECT channel_id, active FROM monitored_channels WHERE id = $1`, [req.params.id]);
     await pool.query(`
       UPDATE monitored_channels
       SET active = NOT active,
@@ -742,12 +765,47 @@ function build(pool) {
           auto_paused_reason = CASE WHEN NOT active THEN NULL ELSE auto_paused_reason END
       WHERE id = $1 AND source = 'telegram'
     `, [req.params.id]);
+    await audit(req, 'toggle', { targetType: 'monitored_channel', targetId: req.params.id, details: { channel_id: before.rows[0]?.channel_id, was_active: before.rows[0]?.active } });
     res.redirect('/admin/telegram-channels?ok=Toggled');
   });
 
   r.post('/admin/telegram-channels/:id/delete', gate, express.urlencoded({ extended: false }), async (req, res) => {
+    const before = await pool.query(`SELECT channel_id FROM monitored_channels WHERE id = $1`, [req.params.id]);
     await pool.query(`DELETE FROM monitored_channels WHERE id = $1 AND source = 'telegram'`, [req.params.id]);
+    await audit(req, 'delete', { targetType: 'monitored_channel', targetId: req.params.id, details: { channel_id: before.rows[0]?.channel_id } });
     res.redirect('/admin/telegram-channels?ok=Deleted');
+  });
+
+  // ── /admin/audit ──────────────────────────────────────────────────
+  // Operator action history. Last 200 actions, newest first.
+  r.get('/admin/audit', gate, async (req, res) => {
+    const q = await pool.query(`
+      SELECT id, actor, action, target_type, target_id, details, ip, created_at
+      FROM operator_audit
+      ORDER BY created_at DESC
+      LIMIT 200
+    `);
+    const rows = q.rows.map(a => `
+      <tr>
+        <td class="muted">${ago(a.created_at)}</td>
+        <td><span class="status-pill" style="background:#1a3a5c;color:#cfe5ff">${escapeHtml(a.action)}</span></td>
+        <td>${escapeHtml(a.target_type || '—')}</td>
+        <td><code style="font-size:11px">${escapeHtml((a.target_id || '').slice(0, 12))}${a.target_id && a.target_id.length > 12 ? '…' : ''}</code></td>
+        <td class="muted">${escapeHtml(a.actor)}</td>
+        <td class="muted">${escapeHtml(a.ip || '—')}</td>
+        <td><pre style="font-size:11px;max-height:80px;overflow:auto;background:#0a0f1a;border:1px solid #1c2330;border-radius:3px;padding:6px">${escapeHtml(a.details ? JSON.stringify(a.details, null, 2).slice(0, 400) : '—')}</pre></td>
+      </tr>
+    `).join('');
+    const body = `
+      <h1>Operator audit log</h1>
+      <div class="muted">Last 200 admin actions. Recorded automatically on every write.</div>
+      ${q.rowCount ? `<table style="margin-top:14px">
+        <thead><tr><th>When</th><th>Action</th><th>Target type</th><th>Target ID</th><th>Actor</th><th>IP</th><th>Details</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>` : '<div class="muted" style="margin-top:14px">No actions logged yet.</div>'}
+    `;
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(adminPage('audit', body));
   });
 
   // ── /admin/threats ────────────────────────────────────────────────

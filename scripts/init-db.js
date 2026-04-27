@@ -198,6 +198,23 @@ async function initSchema(pool) {
   await pool.query(`ALTER TABLE monitored_channels ADD COLUMN IF NOT EXISTS auto_paused_at TIMESTAMPTZ`);
   await pool.query(`ALTER TABLE monitored_channels ADD COLUMN IF NOT EXISTS auto_paused_reason TEXT`);
 
+  // Operator audit log. Every write action via /admin (or via the
+  // CLI scripts) appends a row here. Compliance + customer trust.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS operator_audit (
+      id            BIGSERIAL PRIMARY KEY,
+      actor         TEXT NOT NULL,
+      action        TEXT NOT NULL,
+      target_type   TEXT,
+      target_id     TEXT,
+      details       JSONB,
+      ip            TEXT,
+      created_at    TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS operator_audit_recent ON operator_audit (created_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS operator_audit_target ON operator_audit (target_type, target_id, created_at DESC)`);
+
   // Per-tick worker run log. Lets the dashboard show "last ran X
   // minutes ago, processed N items, errored Y times." Old rows
   // pruned by a periodic VACUUM-style cleanup; for now we keep ~7d.
