@@ -17,26 +17,22 @@ const { Pool } = require('pg');
 const { fetchChannelPosts } = require('../lib/telegram');
 const { processOne, loadActiveTargets } = require('../lib/ingest');
 
-// Seed list. Curated from DFRLab "Understanding Telegram's far-right
-// ecosystem" (2023) + ISD reports. Conservative — channels with
-// documented links to political-violence rhetoric / militia
-// coordination / dox lists.
-//
-// IMPORTANT: this list IS the v1 product. Update by editing this file
-// and pushing — there's no admin UI yet. Each name is the @username
-// without the @, lowercased.
-//
-// Channels can be removed any time without DB changes.
-const SEED_CHANNELS = [
-  // Major aggregator / news channels covering US far-right movements
-  'rightwingextremism',          // ADL/anti-extremism researchers' watch channel
-  'patriotsoapbox',              // QAnon-adjacent
-  // Add more after verifying each is (a) public, (b) active, (c) has
-  // produced political-threat content in the last 30 days.
-  // Recommended next batch (verify before adding):
-  //   'realstewpeters', 'realalexjones', 'lauraloomerofficial',
-  //   'libsoftiktok', 'realmagaagenda', 'saynotofivemore'
-];
+// Bootstrap seed (pre-DB). Used when monitored_channels table is empty.
+// Once channels are added via /admin/telegram-channels, this list is
+// IGNORED (DB takes precedence).
+const SEED_CHANNELS = [];
+
+async function loadActiveChannels(pool) {
+  const r = await pool.query(`
+    SELECT id, channel_id, category, label
+    FROM monitored_channels
+    WHERE source = 'telegram' AND active = TRUE
+    ORDER BY channel_id
+  `);
+  if (r.rowCount > 0) return r.rows;
+  // Fallback to hardcoded SEED_CHANNELS for backwards compat / first run.
+  return SEED_CHANNELS.map(c => ({ id: null, channel_id: c, category: null, label: null }));
+}
 
 const MAX_POSTS_PER_CHANNEL = parseInt(process.env.TELEGRAM_MAX_POSTS, 10) || 20;
 const FETCH_GAP_MS = parseInt(process.env.TELEGRAM_FETCH_GAP_MS, 10) || 1500;
@@ -56,15 +52,29 @@ async function runOnce({ pool, log = console.log }) {
     return { customers: 0, channels: 0, hits_returned: 0, new_mentions: 0, skipped: 0, tier3_plus: 0, errors: 0 };
   }
 
-  for (const channel of SEED_CHANNELS) {
+  const channels = await loadActiveChannels(pool);
+
+  if (channels.length === 0) {
+    log('[telegram] no active channels in monitored_channels — populate via /admin/telegram-channels');
+    return { customers: groups.length, channels: 0, hits_returned: 0, new_mentions: 0, skipped: 0, tier3_plus: 0, errors: 0, error_details: [], note: 'no active channels' };
+  }
+
+  for (const ch of channels) {
+    const channel = ch.channel_id;
     totalChannels++;
     let posts = [];
     try {
       posts = await fetchChannelPosts(channel, { maxPosts: MAX_POSTS_PER_CHANNEL });
+      if (ch.id) {
+        await pool.query('UPDATE monitored_channels SET last_run_at = NOW(), last_post_count = $2, last_error = NULL WHERE id = $1', [ch.id, posts.length]).catch(() => {});
+      }
     } catch (e) {
       errors++;
       errorDetails.push({ channel, error: e.message.slice(0, 200) });
       log(`[telegram] channel ${channel} failed: ${e.message}`);
+      if (ch.id) {
+        await pool.query('UPDATE monitored_channels SET last_run_at = NOW(), last_error = $2 WHERE id = $1', [ch.id, e.message.slice(0, 500)]).catch(() => {});
+      }
       // Polite gap even on failure — t.me throttles aggressive callers
       await new Promise(r => setTimeout(r, FETCH_GAP_MS));
       continue;

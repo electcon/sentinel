@@ -84,6 +84,7 @@ function adminPage(title, body) {
   <a href="/admin/errors">errors</a>
   <a href="/admin/threats">threats</a>
   <a href="/admin/classifier-quality">classifier</a>
+  <a href="/admin/telegram-channels">telegram</a>
 </div>
 <div class="container">
 ${body}
@@ -554,6 +555,106 @@ function build(pool) {
     `;
     res.set('Content-Type', 'text/html; charset=utf-8');
     res.send(adminPage('classifier quality', body));
+  });
+
+  // ── /admin/telegram-channels ──────────────────────────────────────
+  // Operator-curated list of Telegram channels the worker should
+  // monitor. Shared across all customers. Add via paste-form (one
+  // channel-id per line OR JSON array).
+  r.get('/admin/telegram-channels', gate, async (req, res) => {
+    const q = await pool.query(`
+      SELECT id, channel_id, category, label, notes, citation, est_subscribers,
+             active, last_run_at, last_post_count, last_error, created_at
+      FROM monitored_channels
+      WHERE source = 'telegram'
+      ORDER BY active DESC, channel_id ASC
+    `);
+    const flash = req.query.ok ? `<div style="background:#1a4a1a;color:#7fff7f;padding:10px;margin-bottom:14px;border-radius:4px">${escapeHtml(req.query.ok)}</div>` : '';
+    const errFlash = req.query.err ? `<div style="background:#5e0e16;color:#fff;padding:10px;margin-bottom:14px;border-radius:4px">${escapeHtml(req.query.err)}</div>` : '';
+    const rows = q.rows.map(c => {
+      const status = c.active ? '<span class="pill ok">active</span>' : '<span class="pill" style="background:#3d301a;color:#d8902f">paused</span>';
+      const lastRun = c.last_run_at ? `${ago(c.last_run_at)} · ${c.last_post_count || 0} posts` : 'never';
+      const errLine = c.last_error ? `<div class="muted" style="color:#ff7080;font-size:11px;margin-top:4px">⚠ ${escapeHtml(c.last_error.slice(0, 150))}</div>` : '';
+      return `<tr>
+        <td><strong>${escapeHtml(c.channel_id)}</strong>${c.label ? `<div class="muted" style="font-size:11px">${escapeHtml(c.label)}</div>` : ''}${errLine}</td>
+        <td>${c.category ? `<span class="status-pill">${escapeHtml(c.category)}</span>` : '<span class="muted">—</span>'}</td>
+        <td>${status}</td>
+        <td class="muted">${lastRun}</td>
+        <td class="muted" style="max-width:240px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(c.notes || '—')}</td>
+        <td>${c.citation ? `<a href="${escapeHtml(c.citation)}" target="_blank" rel="noopener" style="font-size:11px">cite</a>` : '<span class="muted">—</span>'}</td>
+        <td><a href="https://t.me/s/${escapeHtml(c.channel_id)}" target="_blank" rel="noopener" style="font-size:11px">preview</a></td>
+        <td>
+          <form method="POST" action="/admin/telegram-channels/${c.id}/toggle"><button type="submit" class="${c.active ? '' : 'ok'}" style="background:#1c2330;color:#e6edf3;border:0;padding:4px 8px;border-radius:3px;cursor:pointer;font-size:11px">${c.active ? 'pause' : 'resume'}</button></form>
+          <form method="POST" action="/admin/telegram-channels/${c.id}/delete" onsubmit="return confirm('Delete ${escapeHtml(c.channel_id)}?');" style="display:inline"><button type="submit" style="background:#5e0e16;color:#fff;border:0;padding:4px 8px;border-radius:3px;cursor:pointer;font-size:11px;margin-left:4px">×</button></form>
+        </td>
+      </tr>`;
+    }).join('');
+
+    const body = `
+      <h1>Telegram channels</h1>
+      <div class="muted">Operator-curated seed list. Worker fetches each active channel every 10 min and cross-products against all customers' targets.</div>
+      ${flash}${errFlash}
+      <h2>Active list (${q.rows.filter(r => r.active).length} of ${q.rowCount})</h2>
+      ${q.rowCount ? `<table>
+        <thead><tr><th>Channel</th><th>Category</th><th>Status</th><th>Last run</th><th>Notes</th><th>Source</th><th>Preview</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>` : '<div class="muted">No channels yet. Add some below.</div>'}
+
+      <h2>Add channels</h2>
+      <p class="muted">Paste a JSON array (full schema) OR one channel per line (e.g. <code>realstewpeters</code>) — without the @ prefix.</p>
+      <form method="POST" action="/admin/telegram-channels/bulk-add">
+        <textarea name="bulk" rows="12" placeholder='Either, one per line:&#10;realstewpeters&#10;realalexjones&#10;&#10;Or JSON:&#10;[&#10;  {"channel_id":"realstewpeters","category":"general-far-right","label":"Stew Peters Network","notes":"Steady volume of MAGA-aligned hostile rhetoric","citation":"https://...","est_subscribers":100000},&#10;  {"channel_id":"realalexjones"}&#10;]' style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-family:monospace;font-size:13px"></textarea>
+        <button type="submit" style="background:#4f9af0;color:#fff;border:0;padding:8px 14px;border-radius:4px;cursor:pointer;margin-top:10px">Add</button>
+      </form>
+    `;
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(adminPage('Telegram channels', body));
+  });
+
+  r.post('/admin/telegram-channels/bulk-add', gate, express.urlencoded({ extended: false, limit: '256kb' }), async (req, res) => {
+    const text = String(req.body.bulk || '').trim();
+    if (!text) return res.redirect('/admin/telegram-channels?err=No+input');
+    let entries = [];
+    if (text.startsWith('[') || text.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(text);
+        entries = Array.isArray(parsed) ? parsed : [parsed];
+      } catch (e) {
+        return res.redirect('/admin/telegram-channels?err=' + encodeURIComponent('Invalid JSON: ' + e.message.slice(0, 80)));
+      }
+    } else {
+      entries = text.split(/\r?\n/).map(l => l.trim().replace(/^@/, '')).filter(Boolean).map(channel_id => ({ channel_id }));
+    }
+
+    let added = 0; let updated = 0; let skipped = 0;
+    for (const e of entries) {
+      const cid = String(e.channel_id || '').trim().replace(/^@/, '');
+      if (!/^[a-zA-Z0-9_]{4,40}$/.test(cid)) { skipped++; continue; }
+      const r2 = await pool.query(`
+        INSERT INTO monitored_channels (source, channel_id, category, label, notes, citation, est_subscribers, active)
+        VALUES ('telegram', $1, $2, $3, $4, $5, $6, TRUE)
+        ON CONFLICT (source, channel_id) DO UPDATE
+        SET category = COALESCE(EXCLUDED.category, monitored_channels.category),
+            label = COALESCE(EXCLUDED.label, monitored_channels.label),
+            notes = COALESCE(EXCLUDED.notes, monitored_channels.notes),
+            citation = COALESCE(EXCLUDED.citation, monitored_channels.citation),
+            est_subscribers = COALESCE(EXCLUDED.est_subscribers, monitored_channels.est_subscribers),
+            active = TRUE
+        RETURNING (xmax = 0) AS inserted_new
+      `, [cid, e.category || null, e.label || null, e.notes || null, e.citation || null, e.est_subscribers || null]);
+      if (r2.rows[0].inserted_new) added++; else updated++;
+    }
+    res.redirect(`/admin/telegram-channels?ok=${encodeURIComponent(`Added ${added}, updated ${updated}${skipped ? `, skipped ${skipped}` : ''}`)}`);
+  });
+
+  r.post('/admin/telegram-channels/:id/toggle', gate, express.urlencoded({ extended: false }), async (req, res) => {
+    await pool.query(`UPDATE monitored_channels SET active = NOT active WHERE id = $1 AND source = 'telegram'`, [req.params.id]);
+    res.redirect('/admin/telegram-channels?ok=Toggled');
+  });
+
+  r.post('/admin/telegram-channels/:id/delete', gate, express.urlencoded({ extended: false }), async (req, res) => {
+    await pool.query(`DELETE FROM monitored_channels WHERE id = $1 AND source = 'telegram'`, [req.params.id]);
+    res.redirect('/admin/telegram-channels?ok=Deleted');
   });
 
   // ── /admin/threats ────────────────────────────────────────────────

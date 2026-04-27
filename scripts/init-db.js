@@ -168,6 +168,31 @@ async function initSchema(pool) {
     )
   `);
 
+  // Operator-curated channels for sources where the upstream is a
+  // discrete list (Telegram channels for now; Discord servers /
+  // Mastodon instances later) rather than a general search API.
+  // SHARED across all customers (a channel is monitored once; cross-
+  // product against every active customer's targets via processOne).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS monitored_channels (
+      id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      source          TEXT NOT NULL,
+      channel_id      TEXT NOT NULL,
+      category        TEXT,
+      label           TEXT,
+      notes           TEXT,
+      citation        TEXT,
+      est_subscribers INTEGER,
+      active          BOOLEAN NOT NULL DEFAULT TRUE,
+      last_run_at     TIMESTAMPTZ,
+      last_post_count INTEGER,
+      last_error      TEXT,
+      created_at      TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE (source, channel_id)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS monitored_channels_active ON monitored_channels (source, active) WHERE active = TRUE`);
+
   // Per-tick worker run log. Lets the dashboard show "last ran X
   // minutes ago, processed N items, errored Y times." Old rows
   // pruned by a periodic VACUUM-style cleanup; for now we keep ~7d.
