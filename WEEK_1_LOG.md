@@ -18,7 +18,7 @@ target lists remain to start serving real campaigns.
 
 - [x] `electcon/sentinel` GitHub repo, ~25 commits over the build
 - [x] Render Postgres `sentinel-db` (virginia) — schema initialized
-- [x] Render web service `sentinel-staging-i3ug.onrender.com` — running
+- [x] Render web service `sentinel.parallaxadvisory.llc` — running
 - [x] AWS S3 bucket `sentinel-evidence` (us-east-2) with 30d→Standard-IA,
       90d→Glacier lifecycle. IAM user `sentinel-app` scoped to bucket.
 - [x] Anthropic API key (separate billing from VoteROI)
@@ -106,7 +106,7 @@ v1.2). Synthetic tier-3 + tier-4 threats correctly trigger
       fill in the `customers/TEMPLATE.json` shape (or send via secure
       channel as a list). Then run
       `node scripts/provision-customer.js customers/<slug>.json`.
-- [ ] **Custom domain decision** — `sentinel-staging-i3ug.onrender.com`
+- [ ] **Custom domain decision** — `sentinel.parallaxadvisory.llc`
       is a Render subdomain. Phase 2: register `sentinelhq.com` or
       similar and CNAME to Render.
 - [ ] **Rotate the leaked tokens in chat transcript** — GH PAT, Render

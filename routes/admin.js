@@ -420,7 +420,7 @@ function build(pool) {
       // Optionally fire welcome email.
       let welcomeNote = '';
       if (req.body.send_welcome === '1' && existing.rowCount === 0) {
-        const loginUrl = (process.env.DASHBOARD_BASE_URL || 'https://sentinel-staging-i3ug.onrender.com') + '/login';
+        const loginUrl = (process.env.DASHBOARD_BASE_URL || 'https://sentinel.parallaxadvisory.llc') + '/login';
         const out = await sendWelcome({
           to: contact_email,
           customerName: name,

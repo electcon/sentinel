@@ -125,7 +125,7 @@ async function _callOpenRouter(model, userPrompt, opts) {
     headers: {
       'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
       'Content-Type': 'application/json',
-      'HTTP-Referer': process.env.DASHBOARD_BASE_URL || 'https://sentinel-staging-i3ug.onrender.com',
+      'HTTP-Referer': process.env.DASHBOARD_BASE_URL || 'https://sentinel.parallaxadvisory.llc',
       'X-Title': 'Sentinel'
     },
     body: JSON.stringify({

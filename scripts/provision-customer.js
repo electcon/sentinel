@@ -95,7 +95,7 @@ async function main() {
     console.log(`[provision] target "${t.name}" ${r.rows[0].inserted ? 'created' : 'updated'}: ${r.rows[0].id}`);
   }
 
-  const loginUrl = (process.env.DASHBOARD_BASE_URL || 'https://sentinel-staging-i3ug.onrender.com') + '/login';
+  const loginUrl = (process.env.DASHBOARD_BASE_URL || 'https://sentinel.parallaxadvisory.llc') + '/login';
   console.log('');
   console.log('-----');
   console.log('customer_id:    ', customerId);

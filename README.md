@@ -17,7 +17,7 @@ Three friendly beta cohort:
 ## Architecture summary
 
 ```
-Render web service (sentinel-staging-i3ug.onrender.com)
+Render web service (sentinel.parallaxadvisory.llc)
   ├─ Express HTTP server
   ├─ In-process scheduler (setInterval)
   │   ├─ alert worker      (every 1 min — sends tier-3+ emails)
@@ -85,7 +85,7 @@ Token-gated via `SMOKE_TOKEN` env var. Useful when iterating:
 
 ```bash
 TOK="$SMOKE_TOKEN"
-URL="https://sentinel-staging-i3ug.onrender.com"
+URL="https://sentinel.parallaxadvisory.llc"
 curl -X POST "$URL/api/_smoke/reddit-run" -H "x-smoke-token: $TOK"
 curl -X POST "$URL/api/_smoke/bluesky-run" -H "x-smoke-token: $TOK"
 curl -X POST "$URL/api/_smoke/rss-run" -H "x-smoke-token: $TOK"
@@ -114,19 +114,25 @@ Strongly recommended:
 - `RESEND_API_KEY` — without it, alerts/digests log "DRY-RUN" instead of sending.
   **Important:** the FROM domain must be verified in the Resend account
   attached to this key (see https://resend.com/domains). Defaults are
-  `alerts@voteroi.com` and `digest@voteroi.com`; override via
-  `ALERT_FROM_EMAIL` / `DIGEST_FROM_EMAIL` if your verified domain differs.
+  `alerts@sentinel.parallaxadvisory.llc` and `digest@sentinel.parallaxadvisory.llc`;
+  override via `ALERT_FROM_EMAIL` / `DIGEST_FROM_EMAIL` if your verified
+  domain differs.
 - `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_BUCKET` —
   evidence archive (sentinel-evidence in us-east-2)
 
 Optional / per-source:
+- `DASHBOARD_BASE_URL` — full https URL of dashboard (used in email links).
+  Defaults to `https://sentinel.parallaxadvisory.llc` when unset.
 - `TWITTERAPI_API_KEY` — X ingest via twitterapi.io
+- `FBI_CDE_API_KEY` — FBI Crime Data Explorer (free key from api.data.gov)
+- `CISA_TAXII_*` — see `CISA_AIS_ONBOARDING.md`; worker dormant until set
 - `OPENROUTER_API_KEY` + `CLASSIFIER_PROVIDER=openrouter` + `OPENROUTER_MODEL` —
   use OpenRouter instead of direct Anthropic
 - `SESSION_SECRET` — cookie signing (falls back to SMOKE_TOKEN if unset)
 - `SCHEDULER_ENABLED=true` — force-enable scheduler in non-prod
 - `WORKER_FAIL_THRESHOLD` (default 5), `WORKER_PAUSE_DURATION_MS` (default 30 min)
 - `X_QPS_GAP_MS` (default 5100ms — twitterapi.io free-tier rate limit)
+- `TELEGRAM_STALE_THRESHOLD` (default 5 — auto-pause channel after N empty/error fetches)
 
 ## Tests
 
