@@ -15,7 +15,9 @@
     "ingest:reddit": "node workers/reddit.js",
     "ingest:bluesky": "node workers/bluesky.js",
     "ingest:rss": "node workers/rss.js",
-    "alert:run": "node workers/alert.js"
+    "alert:run": "node workers/alert.js",
+    "digest:run": "node workers/digest.js",
+    "digest:force": "node workers/digest.js --force"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.40.0",

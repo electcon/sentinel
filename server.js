@@ -152,6 +152,18 @@ app.get('/api/_smoke/mentions', requireSmokeToken, async (req, res) => {
   }
 });
 
+// Trigger one digest sweep. Body: { force: true } bypasses the 23h gap.
+app.post('/api/_smoke/digest-run', requireSmokeToken, async (req, res) => {
+  try {
+    const { runOnce } = require('./workers/digest');
+    const force = !!(req.body && req.body.force);
+    const summary = await runOnce({ pool, log: console.log, force });
+    res.json(summary);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Trigger one alert sweep (sends emails for any open un-alerted tier-3+ events).
 app.post('/api/_smoke/alert-run', requireSmokeToken, async (req, res) => {
   try {
@@ -261,10 +273,11 @@ just nothing here yet.</p></body></html>`);
 // Disabled by default in non-production unless SCHEDULER_ENABLED=true.
 // Production (NODE_ENV=production on Render) auto-enables.
 const SCHEDULES = [
-  { name: 'alert',   intervalMs:  60 * 1000, startupDelayMs:  5 * 1000, run: () => require('./workers/alert').runOnce({ pool, log: scheduledLog('alert') }) },
-  { name: 'bluesky', intervalMs:  5 * 60 * 1000, startupDelayMs: 30 * 1000, run: () => require('./workers/bluesky').runOnce({ pool, log: scheduledLog('bluesky') }) },
-  { name: 'reddit',  intervalMs: 10 * 60 * 1000, startupDelayMs: 60 * 1000, run: () => require('./workers/reddit').runOnce({ pool, log: scheduledLog('reddit') }) },
-  { name: 'rss',     intervalMs: 15 * 60 * 1000, startupDelayMs: 90 * 1000, run: () => require('./workers/rss').runOnce({ pool, log: scheduledLog('rss') }) }
+  { name: 'alert',   intervalMs:  60 * 1000,         startupDelayMs:  5 * 1000, run: () => require('./workers/alert').runOnce({ pool, log: scheduledLog('alert') }) },
+  { name: 'bluesky', intervalMs:  5 * 60 * 1000,     startupDelayMs: 30 * 1000, run: () => require('./workers/bluesky').runOnce({ pool, log: scheduledLog('bluesky') }) },
+  { name: 'reddit',  intervalMs: 10 * 60 * 1000,     startupDelayMs: 60 * 1000, run: () => require('./workers/reddit').runOnce({ pool, log: scheduledLog('reddit') }) },
+  { name: 'rss',     intervalMs: 15 * 60 * 1000,     startupDelayMs: 90 * 1000, run: () => require('./workers/rss').runOnce({ pool, log: scheduledLog('rss') }) },
+  { name: 'digest',  intervalMs: 30 * 60 * 1000,     startupDelayMs: 120 * 1000, run: () => require('./workers/digest').runOnce({ pool, log: scheduledLog('digest') }) }
 ];
 
 function scheduledLog(name) {
