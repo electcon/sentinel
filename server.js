@@ -211,43 +211,45 @@ app.post('/api/_smoke/alert-run', requireSmokeToken, async (req, res) => {
   }
 });
 
-// Inject a synthetic tier-3 (or tier-4) mention + threat_event for the
-// dev customer's first target. Lets us test the alert path without
-// waiting for a real threatening Reddit post. Body: { tier?: 3|4 }
+// Inject a synthetic mention for the dev customer. Tier 2 → review queue,
+// tier 3/4 → threat_event for alert worker. Body: { tier?: 2|3|4 }
 app.post('/api/_smoke/inject-test-threat', requireSmokeToken, async (req, res) => {
   try {
-    const tier = (req.body && (req.body.tier === 4 ? 4 : 3)) || 3;
+    const t = (req.body && req.body.tier);
+    const tier = t === 2 ? 2 : t === 4 ? 4 : 3;
     const cust = await pool.query(`SELECT id, name, alert_email FROM customers WHERE name = 'Sentinel Dev (test)' LIMIT 1`);
     if (!cust.rowCount) return res.status(400).json({ error: 'dev customer not found — run seed-dev first' });
     const tgt = await pool.query(`SELECT id, name FROM targets WHERE customer_id = $1 LIMIT 1`, [cust.rows[0].id]);
     if (!tgt.rowCount) return res.status(400).json({ error: 'dev target not found' });
 
-    const synthBody = tier === 4
-      ? 'I am driving to her event in Concord tomorrow with my rifle. She is not going to walk out of that building alive.'
-      : 'She lives at 14 Maple Street in Concord NH. Anyone in the area should pay her a visit and let her know what we think of her family. She wont be safe.';
-
+    const SYNTH = {
+      2: { body: 'Warmington is a corrupt witch and her whole family are leeches. They all deserve to be run out of NH for good.', rationale: 'Synthetic tier-2 test: dehumanizing labels + family attack + mob-removal language' },
+      3: { body: 'She lives at 14 Maple Street in Concord NH. Anyone in the area should pay her a visit and let her know what we think of her family. She wont be safe.', rationale: 'Synthetic tier-3 test: doxxing + menacing tone' },
+      4: { body: 'I am driving to her event in Concord tomorrow with my rifle. She is not going to walk out of that building alive.', rationale: 'Synthetic tier-4 test: explicit threat + weapon + time-bound location' }
+    };
+    const synth = SYNTH[tier];
     const sourceId = 'synth_' + Date.now() + '_t' + tier;
+    const reviewStatus = tier === 2 ? 'pending' : null;
+
     const ins = await pool.query(`
       INSERT INTO mentions (
         customer_id, target_id, source, source_id, source_url,
         author_handle, posted_at, body_excerpt,
-        threat_tier, sentiment, rationale, classifier_v
+        threat_tier, sentiment, rationale, classifier_v, review_status
       ) VALUES (
         $1, $2, 'synth', $3, 'https://example.com/synth',
         'synth_test', NOW(), $4,
-        $5, -2, $6, 'tax-v1.2'
+        $5, -2, $6, 'tax-v1.2', $7
       ) RETURNING id
-    `, [
-      cust.rows[0].id, tgt.rows[0].id, sourceId, synthBody, tier,
-      tier === 4 ? 'Synthetic tier-4 test: explicit threat + weapon + time-bound location'
-                 : 'Synthetic tier-3 test: doxxing + menacing tone'
-    ]);
+    `, [cust.rows[0].id, tgt.rows[0].id, sourceId, synth.body, tier, synth.rationale, reviewStatus]);
     const mentionId = ins.rows[0].id;
 
-    await pool.query(`
-      INSERT INTO threat_events (mention_id, customer_id, target_id, tier, status)
-      VALUES ($1, $2, $3, $4, 'open')
-    `, [mentionId, cust.rows[0].id, tgt.rows[0].id, tier]);
+    if (tier >= 3) {
+      await pool.query(`
+        INSERT INTO threat_events (mention_id, customer_id, target_id, tier, status)
+        VALUES ($1, $2, $3, $4, 'open')
+      `, [mentionId, cust.rows[0].id, tgt.rows[0].id, tier]);
+    }
 
     res.json({
       ok: true,
@@ -256,7 +258,9 @@ app.post('/api/_smoke/inject-test-threat', requireSmokeToken, async (req, res) =
       target: tgt.rows[0].name,
       customer: cust.rows[0].name,
       alert_email: cust.rows[0].alert_email,
-      next: 'POST /api/_smoke/alert-run to fire the alert email'
+      next: tier === 2
+        ? 'visit /dashboard/review-queue to triage'
+        : 'POST /api/_smoke/alert-run to fire the alert email'
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
