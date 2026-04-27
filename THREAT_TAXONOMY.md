@@ -13,16 +13,27 @@ are tolerable (alert fatigue is fixable). When in doubt, escalate one tier.
 
 ## Tier 1 — Noise
 
-**Definition:** Critical, mocking, dismissive, or impolite content that
-expresses opinion or disagreement without targeting the person's safety,
-family, livelihood, or property. The 99th percentile of social-media
-political speech.
+**Definition:** Critical, mocking, dismissive, or impolite content
+**directed at the candidate's politics, performance, or judgment** —
+without (a) dehumanizing language, (b) attacks on family members,
+(c) threats, or (d) calls for the candidate to be physically removed.
+The 99th percentile of social-media political speech.
 
-**Examples:**
+**Hard rule — these push it OUT of Tier 1 (into Tier 2 or higher):**
+- Any reference to the target's family, spouse, or children that is
+  not purely positive
+- Dehumanizing labels: witch, demon, vermin, parasite, leech, traitor,
+  scum, "the [X]s" used as a slur for an ethnic / religious group
+- "Should be" or "deserve to be" + adverse outcome aimed at the person
+  (not just their political career)
+- Mob-language: "run out of [town]," "drag them out," "make them pay"
+
+**Examples (true Tier 1):**
 - "Eileen Laubacher is a terrible candidate, she'll lose by 20 points."
 - "What an idiot. This is why we're losing."
 - "This guy doesn't deserve to win."
 - "She's a sellout, classic establishment dem."
+- "Worst speech I've ever heard. Pure word salad."
 - Repeated "L" or laugh-react emoji on the candidate's post.
 
 **Action:** Indexed for analytics (volume / sentiment / velocity charts).
@@ -46,6 +57,12 @@ without specific threats, doxxing, or escalation language. Includes:
 - "She's a coward and her family should be ashamed."
 - "Time to take this clown out of public life. Dig up everything."
 - "Hope karma comes for him."
+- "She's a corrupt witch and her whole family are leeches. They all
+  deserve to be run out of [state] for good." *(dehumanizing labels +
+  family attack + mob-removal language — clear Tier 2 even without
+  any specific threat)*
+- "His wife is a real piece of work too. The whole family is gross."
+  *(family attack with non-positive valence, no specific threat)*
 - 80 accounts under 30 days old all posting "Laubacher = liar" in 2 hours.
 
 **Action:** Lands in the human review queue (not auto-escalated to

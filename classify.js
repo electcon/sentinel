@@ -24,7 +24,7 @@ const MODEL_ESCALATE = process.env.ANTHROPIC_MODEL_ESCALATE || 'claude-sonnet-4-
 // classifications.prompt_v audit trail can show which rubric a tier
 // was decided under.
 const TAXONOMY = fs.readFileSync(path.join(__dirname, 'THREAT_TAXONOMY.md'), 'utf8');
-const PROMPT_V = 'tax-v1.0';
+const PROMPT_V = 'tax-v1.1';
 
 const SYSTEM = `You are a threat-classification model for Sentinel, a defensive
 monitoring tool used by Democratic and Indy-aligned political campaigns.
