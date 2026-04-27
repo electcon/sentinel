@@ -49,6 +49,30 @@ app.get('/api/health', async (req, res) => {
   });
 });
 
+// ── Smoke: classify (week-1 only, gated by SMOKE_TOKEN env) ─────────
+// Will be removed once a real admin auth layer lands in week 5.
+// Posts: { text, target?, source? } -> classifier output JSON.
+app.post('/api/_smoke/classify', async (req, res) => {
+  const tok = req.get('x-smoke-token') || '';
+  const expected = process.env.SMOKE_TOKEN || '';
+  if (!expected || tok !== expected) return res.status(401).json({ error: 'bad token' });
+  try {
+    const { classify } = require('./classify');
+    const body = (req.body && req.body.text) || '';
+    if (!body) return res.status(400).json({ error: 'text required' });
+    const out = await classify({
+      targetName: req.body.target || 'Test Candidate',
+      body,
+      source: req.body.source || 'smoke',
+      authorHandle: 'smoke-test',
+      postedAt: new Date().toISOString()
+    });
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Stub: dashboard ─────────────────────────────────────────────────
 // Replaced in week 5 by the real dashboard. For now, a placeholder so
 // the web service has something at `/`.
