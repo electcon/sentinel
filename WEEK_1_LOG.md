@@ -32,44 +32,63 @@ Started: 2026-04-26.
       1-page beta agreement template, talking-point script
 - [x] `WEEK_1_LOG.md` (this file)
 
-## Blocked on you (David)
+## Status update (end of week 1)
 
-- [ ] **Sentinel GitHub org** created — I need org name + admin access
-      to push the `sentinel/` directory as the initial commit there.
-- [ ] **Sentinel Render account** + Postgres provisioned — I need the
-      `DATABASE_URL` so I can run schema init on the real DB before
-      the contractor onboards.
-- [ ] **Sentinel Stripe account** opened (separate from AMII PAC's
-      VoteROI Stripe per your decision).
-- [ ] **Anthropic API key** for Sentinel (separate from VoteROI's,
-      different billing). Needed so the classifier smoke-test works
-      against real DB.
-- [ ] **AWS S3 bucket** `sentinel-evidence` created in us-east-1 with
-      lifecycle policy: STANDARD → STANDARD_IA at 30d → GLACIER at
-      90d → no expiration. IAM credentials with PutObject + GetObject
-      scoped to that bucket.
+**Major scope shift, 2026-04-26:** David decided to build Sentinel solo
+with Claude doing all engineering. No contractor hire. `HIRING.md` is
+shelved. All week-2+ ingest / dashboard / alert work falls on Claude.
+
+## Done (week 1)
+
+- [x] GitHub repo `electcon/sentinel` provisioned, scaffold pushed
+- [x] Render service `sentinel-staging-i3ug.onrender.com` deployed,
+      `/api/health` returns 200, DB ping <50ms
+- [x] Postgres `sentinel-db` (Render, virginia-postgres) — 6 tables
+      initialized and verified
+- [x] AWS S3 `sentinel-evidence` (us-east-2) provisioned with
+      lifecycle: STANDARD → STANDARD-IA at 30d → GLACIER at 90d.
+      IAM user `sentinel-app` scoped to bucket. PutObject/GetObject
+      round-trip verified.
+- [x] `ANTHROPIC_API_KEY` provisioned for Sentinel (separate from
+      VoteROI billing)
+- [x] Classifier live end-to-end. 6/6 tier-classification cases pass
+      under taxonomy v1.2. `/api/_smoke/classify` token-gated for
+      ongoing eval runs.
+- [x] Codename/public-name decision: **Sentinel** is both. No rebrand.
+
+## Blocked on you (David) — unchanged or new
+
 - [ ] **Beta-pitch email forwards** — three emails to Jolly, Sands,
       Laubacher campaign managers. Use the `BETA_PITCH.md` 1-paragraph
       body. Goal: meetings booked by Friday May 2.
-- [ ] **Engineer sourcing** — paste / forward the templates in
-      `HIRING.md`. Higher Ground Labs Slack first; YC May-1 thread; 5
-      personal DMs. I review the inbound replies and run the screening
-      Q&A.
-- [ ] **Codename / public-name decision** — Sentinel for internal use
-      is fine. Public-facing name decision needed before week 5
-      (dashboard ships with copy that names the product).
+- [ ] **Reddit API credentials** (week 2) — register a Reddit app at
+      https://www.reddit.com/prefs/apps as "script" type. I need
+      `client_id`, `client_secret`, and a service account username +
+      password. App-only OAuth is fine for our read-only search needs.
+- [ ] **Bluesky API credentials** (week 2) — Bluesky uses an
+      app-password flow. Create one at bsky.app → Settings → App
+      Passwords. I need the handle + app password.
+- [ ] **Rotate leaked tokens** — GH PAT, Render API key, AWS access
+      key all exist in chat transcript. Rotate after week 2 if you
+      haven't already.
 
-## What I'm doing next (week 2 of execution, week 1 with contractor)
+## What I'm doing next (week 2)
 
-Once the contractor is onboard and the env-var blockers above are
-unblocked:
+Solo build kickoff:
 
-1. Reddit ingest worker — implements the stub at workers/reddit.js per
-   the embedded task list
-2. Bluesky ingest worker — same shape
-3. RSS worker + per-customer feed configuration UI (admin-only screen)
-4. End-to-end: ingest one real Reddit post → classify → DB write → S3
-   archive. Demo via local cli that writes one mention end-to-end.
+1. **Reddit ingest worker** — full implementation of `workers/reddit.js`.
+   Per-customer search-term fan-out, idempotent inserts via
+   `mentions(source, source_id)` unique constraint, S3 archive of
+   raw payload, classifier pass on every match, `classifications`
+   audit row written.
+2. **Bluesky ingest worker** — same shape, AT-protocol search.
+3. **RSS worker** — per-customer feed config table + ingest loop.
+4. **End-to-end demo** — a real public Reddit post about a real
+   target lands in DB, gets classified, gets archived to S3.
+5. **Cron / scheduler** — Render cron service runs each worker on a
+   short interval (Reddit/Bluesky every 5 min, RSS every 15 min).
+6. **Daily digest** — cron that gathers each customer's last-24h
+   activity and emails it via Resend.
 
 ## Risks I'm watching
 

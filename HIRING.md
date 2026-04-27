@@ -1,5 +1,11 @@
 # Sentinel — engineering hire pack
 
+> **STATUS: SHELVED 2026-04-26.** David decided to build Sentinel solo
+> with Claude doing all the engineering. No contractor will be hired
+> for the v1 build. This file is kept on disk for reference if the
+> decision is revisited (e.g., post-launch when Phase 2 budget is sized).
+> Do **not** post these templates or send the outreach DMs.
+
 You forward / paste these. I can't post to your Slack channels or
 hiring forums; you do that part. Templates below.
 

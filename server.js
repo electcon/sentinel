@@ -49,13 +49,19 @@ app.get('/api/health', async (req, res) => {
   });
 });
 
-// ── Smoke: classify (week-1 only, gated by SMOKE_TOKEN env) ─────────
-// Will be removed once a real admin auth layer lands in week 5.
-// Posts: { text, target?, source? } -> classifier output JSON.
-app.post('/api/_smoke/classify', async (req, res) => {
+// ── Smoke endpoints (week-1/2 only, gated by SMOKE_TOKEN env) ───────
+// All under /api/_smoke/* and removed once a real admin auth layer
+// lands in week 5.
+
+function requireSmokeToken(req, res, next) {
   const tok = req.get('x-smoke-token') || '';
   const expected = process.env.SMOKE_TOKEN || '';
   if (!expected || tok !== expected) return res.status(401).json({ error: 'bad token' });
+  next();
+}
+
+// Classify a synthetic mention end-to-end.
+app.post('/api/_smoke/classify', requireSmokeToken, async (req, res) => {
   try {
     const { classify } = require('./classify');
     const body = (req.body && req.body.text) || '';
@@ -68,6 +74,75 @@ app.post('/api/_smoke/classify', async (req, res) => {
       postedAt: new Date().toISOString()
     });
     res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Trigger one Reddit ingest run. Returns the per-customer summary.
+app.post('/api/_smoke/reddit-run', requireSmokeToken, async (req, res) => {
+  try {
+    const { runOnce } = require('./workers/reddit');
+    const log = (m) => console.log(m);
+    const summary = await runOnce({ pool, log });
+    res.json(summary);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Idempotent dev-customer seeder. POST to provision the test customer
+// and dev targets (Cinde Warmington, Eileen Laubacher, Charlie Crist).
+app.post('/api/_smoke/seed-dev', requireSmokeToken, async (req, res) => {
+  try {
+    const child_process = require('child_process');
+    child_process.execFile(process.execPath, ['scripts/seed-dev.js'], { cwd: __dirname }, (err, stdout, stderr) => {
+      if (err) return res.status(500).json({ error: err.message, stdout, stderr });
+      res.json({ ok: true, stdout, stderr });
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Read most-recent mentions for inspection. Optional ?customer_name=foo
+// or ?tier=3 filters.
+app.get('/api/_smoke/mentions', requireSmokeToken, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
+    const tierFilter = req.query.tier ? `AND m.threat_tier >= ${parseInt(req.query.tier, 10)}` : '';
+    const r = await pool.query(`
+      SELECT m.id, m.source, m.source_id, m.source_url, m.posted_at, m.ingested_at,
+             m.threat_tier, m.sentiment, m.rationale, m.classifier_v, m.s3_key,
+             m.body_excerpt, c.name AS customer_name, t.name AS target_name
+      FROM mentions m
+      JOIN customers c ON c.id = m.customer_id
+      LEFT JOIN targets t ON t.id = m.target_id
+      WHERE 1=1 ${tierFilter}
+      ORDER BY m.ingested_at DESC
+      LIMIT $1
+    `, [limit]);
+    res.json({ count: r.rowCount, mentions: r.rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Open threat queue.
+app.get('/api/_smoke/threats', requireSmokeToken, async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT te.id, te.tier, te.status, te.created_at, te.alerted_at,
+             m.body_excerpt, m.source, m.source_url, m.s3_key,
+             c.name AS customer_name, t.name AS target_name
+      FROM threat_events te
+      JOIN mentions m ON m.id = te.mention_id
+      JOIN customers c ON c.id = te.customer_id
+      LEFT JOIN targets t ON t.id = te.target_id
+      ORDER BY te.tier DESC, te.created_at DESC
+      LIMIT 100
+    `);
+    res.json({ count: r.rowCount, threats: r.rows });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
