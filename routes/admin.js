@@ -240,6 +240,34 @@ function build(pool) {
     const mentionRows = recent.rows.map(m => `<tr><td>T${m.threat_tier || '—'}</td><td>${escapeHtml(m.target_name || '—')}</td><td>${escapeHtml(m.source)}</td><td>${escapeHtml((m.body_excerpt || '').slice(0, 120))}</td><td class="muted">${ago(m.posted_at)}</td></tr>`).join('');
 
     const flash = req.query.ok ? `<div style="background:#1a4a1a;color:#7fff7f;padding:10px;margin-bottom:14px;border-radius:4px">${escapeHtml(req.query.ok)}</div>` : '';
+
+    // Geographic risk panel — best-effort lookup; hides on failure.
+    let riskPanel = '';
+    if (cust.state) {
+      try {
+        const { riskSummaryForState } = require('../lib/fbi-cde');
+        const r2 = await riskSummaryForState(cust.state);
+        if (r2 && !r2.error) {
+          riskPanel = `<div class="card" style="margin-top:14px;background:#101a26;border:1px solid #1c2330">
+            <div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Geographic context — FBI CDE</div>
+            <div style="font-size:20px;font-weight:600">${r2.total_incidents} hate-crime incidents</div>
+            <div class="muted" style="margin-top:4px">${escapeHtml(cust.state)} · ${escapeHtml(r2.year_range)} · refresh: ${escapeHtml(r2.last_refresh || '—')}</div>
+            <div style="margin-top:10px;display:grid;grid-template-columns:repeat(2,1fr);gap:6px;font-size:13px">
+              <div><span class="muted">vs individuals:</span> ${r2.against_individuals}</div>
+              <div><span class="muted">vs government:</span> ${r2.against_government}</div>
+              <div><span class="muted">vs religious org:</span> ${r2.against_religious_org}</div>
+              <div><span class="muted">vs LE officers:</span> ${r2.against_law_enforcement}</div>
+            </div>
+            ${r2.top_offense ? `<div class="muted" style="margin-top:8px;font-size:12px">Top offense: <strong>${escapeHtml(r2.top_offense.name)}</strong> (${r2.top_offense.count})</div>` : ''}
+          </div>`;
+        } else if (r2 && r2.error) {
+          riskPanel = `<div class="card" style="margin-top:14px"><div class="muted">Geographic risk lookup failed: ${escapeHtml(r2.error)}</div></div>`;
+        }
+      } catch (e) {
+        riskPanel = `<div class="card" style="margin-top:14px"><div class="muted">Geographic risk lookup unavailable: ${escapeHtml(e.message)}</div></div>`;
+      }
+    }
+
     const body = `
       <a href="/admin/customers" class="muted">← all customers</a>
       <h1 style="margin-top:14px">${escapeHtml(cust.name)}</h1>
@@ -249,8 +277,9 @@ function build(pool) {
         <div class="muted">contact: ${escapeHtml(cust.contact_email)}</div>
         <div class="muted">alert: ${escapeHtml(cust.alert_email)}</div>
         <div class="muted">digest: ${escapeHtml(cust.digest_email)}</div>
-        <div class="muted">status: ${escapeHtml(cust.status)} · created: ${fmtTime(cust.created_at)} · last digest: ${fmtTime(cust.last_digest_at)}</div>
+        <div class="muted">state: ${cust.state ? escapeHtml(cust.state) : '<em>not set</em>'} · status: ${escapeHtml(cust.status)} · created: ${fmtTime(cust.created_at)} · last digest: ${fmtTime(cust.last_digest_at)}</div>
       </div>
+      ${riskPanel}
       <h2>Targets (${targets.rowCount})</h2>
       ${targets.rowCount ? `<table><thead><tr><th>Kind</th><th>Name</th><th>Aliases</th><th>Search terms</th></tr></thead><tbody>${targetRows}</tbody></table>` : '<div class="muted">No targets.</div>'}
       <h2>Recent mentions (${recent.rowCount})</h2>
@@ -340,6 +369,11 @@ function build(pool) {
           </select>
         </div>
         <div style="margin-bottom:14px">
+          <label style="display:block;color:#8b949e;font-size:13px;margin-bottom:6px">Candidate's state (2-letter postal abbrev, optional)</label>
+          <input type="text" name="state" maxlength="2" placeholder="NH" pattern="[A-Za-z]{2}" style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:14px;text-transform:uppercase">
+          <div style="color:#8b949e;font-size:12px;margin-top:4px">Used for hate-crime risk lookup via FBI CDE.</div>
+        </div>
+        <div style="margin-bottom:14px">
           <label style="display:block;color:#8b949e;font-size:13px;margin-bottom:6px">Targets — one per line OR JSON array</label>
           <textarea name="targets" rows="10" placeholder='Either:&#10;Cinde Warmington&#10;Tom Sherman (her partner)&#10;&#10;Or:&#10;[&#10;  {"kind":"candidate","name":"Cinde Warmington","aliases":["Warmington"],"search_terms":["Cinde Warmington"]},&#10;  {"kind":"family","name":"Tom Sherman"}&#10;]' style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:13px;font-family:monospace"></textarea>
         </div>
@@ -367,6 +401,8 @@ function build(pool) {
         return res.redirect('/admin/provision?err=' + encodeURIComponent('Password must be ≥ 8 chars'));
       }
       const useStatus = ['beta', 'active', 'paused'].includes(status) ? status : 'beta';
+      const rawState = String(req.body.state || '').toUpperCase().trim();
+      const useState = /^[A-Z]{2}$/.test(rawState) ? rawState : null;
 
       // Parse targets: JSON array or one-name-per-line.
       const targetsText = String(req.body.targets || '').trim();
@@ -395,11 +431,11 @@ function build(pool) {
       let customerId;
       if (existing.rowCount > 0) {
         customerId = existing.rows[0].id;
-        await pool.query(`UPDATE customers SET contact_email=$2, alert_email=$3, digest_email=$4, status=$5, password_hash=$6 WHERE id=$1`,
-          [customerId, contact_email, alert_email, digest_email, useStatus, passwordHash]);
+        await pool.query(`UPDATE customers SET contact_email=$2, alert_email=$3, digest_email=$4, status=$5, password_hash=$6, state=$7 WHERE id=$1`,
+          [customerId, contact_email, alert_email, digest_email, useStatus, passwordHash, useState]);
       } else {
-        const ins = await pool.query(`INSERT INTO customers (name, contact_email, alert_email, digest_email, status, password_hash) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-          [name, contact_email, alert_email, digest_email, useStatus, passwordHash]);
+        const ins = await pool.query(`INSERT INTO customers (name, contact_email, alert_email, digest_email, status, password_hash, state) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+          [name, contact_email, alert_email, digest_email, useStatus, passwordHash, useState]);
         customerId = ins.rows[0].id;
       }
       let created = 0, updated = 0;

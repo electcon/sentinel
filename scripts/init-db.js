@@ -22,9 +22,11 @@ async function initSchema(pool) {
       digest_email  TEXT NOT NULL,
       status        TEXT NOT NULL DEFAULT 'beta',
       password_hash TEXT,
+      state         CHAR(2),
       created_at    TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+  await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS state CHAR(2)`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS targets (
