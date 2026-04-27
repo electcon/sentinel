@@ -1,0 +1,4 @@
+# Real customer JSON files contain plaintext passwords + PII.
+# Never commit. Only TEMPLATE.json + this gitignore are tracked.
+*.json
+!TEMPLATE.json

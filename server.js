@@ -262,22 +262,14 @@ app.get('/api/_smoke/threats', requireSmokeToken, async (req, res) => {
   }
 });
 
-// ── Stub: dashboard ─────────────────────────────────────────────────
-// Replaced in week 5 by the real dashboard. For now, a placeholder so
-// the web service has something at `/`.
-app.get('/', (req, res) => {
-  res.set('Content-Type', 'text/html; charset=utf-8');
-  res.send(`<!doctype html><html><head><meta charset=utf-8><title>Sentinel</title>
-<style>body{background:#0a0f1a;color:#e6edf3;font-family:Inter,system-ui,sans-serif;padding:60px;max-width:680px;margin:0 auto}
-code{background:rgba(255,255,255,.06);padding:2px 6px;border-radius:4px}
-h1{margin-bottom:8px}.muted{color:#8b949e}</style></head>
-<body><h1>Sentinel</h1>
-<p class=muted>Defensive social-media + threat-monitoring platform.
-Internal codename. Public-facing UI ships <strong>2026-06-15</strong>.</p>
-<p>Health: <code>/api/health</code></p>
-<p class=muted>If you reached this URL by accident, you're not in the wrong place — there's
-just nothing here yet.</p></body></html>`);
-});
+// ── Customer-facing dashboard + auth routes ────────────────────────
+// Mounted at root so routes are at /login, /dashboard, /dashboard/...
+app.use(require('./routes/dashboard')(pool));
+
+// Root redirects to dashboard (authed) or login (unauthed). The
+// dashboard middleware itself handles the redirect by checking the
+// session cookie.
+app.get('/', (req, res) => res.redirect('/dashboard'));
 
 // ── In-process scheduler ────────────────────────────────────────────
 // At v1 scale we run the ingest + alert workers directly inside the

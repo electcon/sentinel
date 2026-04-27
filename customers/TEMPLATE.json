@@ -1,0 +1,29 @@
+{
+  "_README": "Copy this file to <campaign-slug>.json (e.g. jolly-for-governor.json), fill in the real values, and run `node scripts/provision-customer.js customers/<filename>`. Re-running with the same name updates an existing customer in place.",
+  "name": "Campaign Display Name",
+  "contact_email": "manager@example.com",
+  "alert_email": "alerts@example.com",
+  "digest_email": "digest@example.com",
+  "password": "CHANGE_ME_8_PLUS_CHARS",
+  "status": "beta",
+  "targets": [
+    {
+      "kind": "candidate",
+      "name": "Full Candidate Name",
+      "aliases": ["LastName", "FirstName"],
+      "search_terms": ["Full Candidate Name", "Campaign Slogan"]
+    },
+    {
+      "kind": "family",
+      "name": "Spouse Full Name",
+      "aliases": ["LastName"],
+      "search_terms": ["Spouse Full Name"]
+    },
+    {
+      "kind": "staff",
+      "name": "Chief of Staff Full Name",
+      "aliases": [],
+      "search_terms": ["Chief of Staff Full Name"]
+    }
+  ]
+}
