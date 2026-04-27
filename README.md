@@ -73,9 +73,16 @@ re-run `provision-customer.js` with an updated JSON.
 
 ### Operating views
 
+- `/` — public marketing landing page + beta-access form (unauthed); auto-redirects to `/dashboard` if session cookie valid
 - `/dashboard` — customer view (logged-in)
-- `/admin` — David's view (Basic auth via `ADMIN_PASSWORD`); shows all
-  customers, worker health, errors, threats across the system
+- `/admin` — David's view (Basic auth via `ADMIN_PASSWORD`):
+  - `/admin/customers` (+ `/admin/customers/:id` per-customer detail with hate-crime risk panel)
+  - `/admin/provision` web form to onboard new customers
+  - `/admin/leads` — beta-access form submissions with status workflow
+  - `/admin/audit` — operator action history
+  - `/admin/classifier-quality` — reviewer-disposition rollups for drift detection
+  - `/admin/telegram-channels` — operator-curated seed list
+  - `/admin/workers`, `/admin/errors`, `/admin/threats`
 - `/status` — public health page (no PII)
 - `/api/health` — JSON health check (used by uptime monitors)
 

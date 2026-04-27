@@ -86,6 +86,42 @@ runs. Classifier 6/6 correct against synthetic tier rubric (taxonomy
 v1.2). Synthetic tier-3 + tier-4 threats correctly trigger
 `threat_events` rows + alert worker (dry-run).
 
+## Day 2 (2026-04-27) — extensions + production readiness
+
+Continuous afternoon block while David handled signups. Six tasks shipped:
+
+- [x] **TruthSocial scaffold** — Mastodon-API client + worker; dormant
+      until `TRUTHSOCIAL_ACCESS_TOKEN` set. Onboarding doc included.
+- [x] **FBI CDE — real hate-crime endpoint** + `customers.state` column
+      + geographic-risk panel on `/admin/customers/:id` (replaces
+      violent-crime proxy with actual hate-crime stats per state).
+- [x] **Pre-launch smoke hardening** — `SMOKE_DISABLED=true` master
+      kill switch; high-risk endpoints (alert-run, digest-run,
+      cleanup-duplicates, seed-dev, inject-test-threat, cross-customer
+      reads) now require `X-Admin-Password` *in addition to* the smoke
+      token; banner on `/admin` shows current smoke state.
+- [x] **Operator audit log** — `operator_audit` table; every admin
+      write action recorded; `/admin/audit` page shows last 200 actions.
+- [x] **Public marketing landing page at root** + beta-access form
+      with `/admin/leads` workflow (new → contacted → qualified →
+      converted/declined). Authed visitors still redirect to
+      `/dashboard`.
+- [x] **Telegram stale-channel auto-pause** — 5 consecutive empty/error
+      fetches → auto-mark inactive with distinct red badge + reason.
+      Resume via UI clears the counter.
+- [x] **27-channel Telegram seed list** at `data/telegram-seed-list.json`
+      — DFRLab/ADL/SPLC/GNET/Logically/ProPublica-cited channels;
+      paste-import via `/admin/telegram-channels` bulk-add UI.
+- [x] **Custom domain live** — `sentinel.parallaxadvisory.llc` CNAMEd
+      to Render; TLS auto-issued; Cloudflare CDN in front. All hardcoded
+      URL fallbacks swapped from `*.onrender.com`.
+- [x] **Welcome email auto-fire** from both CLI provisioning and
+      `/admin/provision` web form, factored into `lib/welcome.js`.
+- [x] **First-login empty-state banner** on `/dashboard` for fresh
+      customers (0 mentions / 0 threats / 0 review-queue).
+- [x] **Resend domain verification** — `sentinel.parallaxadvisory.llc`
+      verified in Resend; real digest delivery confirmed end-to-end.
+
 ## Blocked on you (David) — week 2 pickup
 
 - [ ] **Resend API key** for Sentinel — without this, alerts and digests
