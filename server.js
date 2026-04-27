@@ -242,6 +242,63 @@ app.post('/api/_smoke/inject-test-threat', requireSmokeToken, async (req, res) =
   }
 });
 
+// Consolidate duplicate customers by name. For each name with N>1 rows,
+// pick the row with the most mentions as primary and:
+//   1. UPDATE all targets/mentions/threat_events/classifications to point to primary
+//   2. DELETE the other customers and their now-empty target rows
+// Bounded by name; idempotent. Used to clean up the legacy seed-dev
+// bug that produced two "Sentinel Dev (test)" customers.
+app.post('/api/_smoke/cleanup-duplicates', requireSmokeToken, async (req, res) => {
+  try {
+    const dups = await pool.query(`
+      SELECT name, COUNT(*)::int AS n FROM customers GROUP BY name HAVING COUNT(*) > 1
+    `);
+    const result = [];
+    for (const d of dups.rows) {
+      const all = await pool.query(`
+        SELECT c.id, COALESCE(m.n, 0)::int AS mention_count
+        FROM customers c
+        LEFT JOIN (SELECT customer_id, COUNT(*) AS n FROM mentions GROUP BY customer_id) m ON m.customer_id = c.id
+        WHERE c.name = $1
+        ORDER BY mention_count DESC, c.created_at ASC
+      `, [d.name]);
+      const primary = all.rows[0].id;
+      const orphans = all.rows.slice(1).map(r => r.id);
+      // Reparent everything from orphans → primary. Targets need name uniqueness
+      // collapse, so reparent then dedupe.
+      let mentionsMoved = 0, targetsMoved = 0, threatsMoved = 0, dropped = 0;
+      for (const o of orphans) {
+        const ms = await pool.query('UPDATE mentions SET customer_id = $1 WHERE customer_id = $2', [primary, o]);
+        mentionsMoved += ms.rowCount;
+        const ts = await pool.query('UPDATE threat_events SET customer_id = $1 WHERE customer_id = $2', [primary, o]);
+        threatsMoved += ts.rowCount;
+        // Targets: reparent BUT collide with the unique (customer_id, name) index.
+        // Strategy: drop orphan targets that have a name-twin under primary;
+        // reparent the rest.
+        const tgts = await pool.query('SELECT id, name FROM targets WHERE customer_id = $1', [o]);
+        for (const tg of tgts.rows) {
+          const dupe = await pool.query('SELECT id FROM targets WHERE customer_id = $1 AND name = $2', [primary, tg.name]);
+          if (dupe.rowCount > 0) {
+            // Repoint mentions that point to this orphan target, then drop the orphan target row.
+            await pool.query('UPDATE mentions SET target_id = $1 WHERE target_id = $2', [dupe.rows[0].id, tg.id]);
+            await pool.query('UPDATE threat_events SET target_id = $1 WHERE target_id = $2', [dupe.rows[0].id, tg.id]);
+            await pool.query('DELETE FROM targets WHERE id = $1', [tg.id]);
+            dropped++;
+          } else {
+            await pool.query('UPDATE targets SET customer_id = $1 WHERE id = $2', [primary, tg.id]);
+            targetsMoved++;
+          }
+        }
+        await pool.query('DELETE FROM customers WHERE id = $1', [o]);
+      }
+      result.push({ name: d.name, primary, orphans_dropped: orphans.length, mentions_moved: mentionsMoved, targets_moved: targetsMoved, threats_moved: threatsMoved, target_dupes_dropped: dropped });
+    }
+    res.json({ ok: true, consolidated: result.length, details: result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Open threat queue.
 app.get('/api/_smoke/threats', requireSmokeToken, async (req, res) => {
   try {

@@ -71,12 +71,26 @@ async function main() {
   // because there's no unique constraint on customers.name in v1
   // (real customers can legitimately share names). The dev customer
   // is identified by a name string we control.
-  const existing = await pool.query('SELECT id FROM customers WHERE name = $1 LIMIT 1', [DEV_CUSTOMER.name]);
+  //
+  // If duplicates exist (legacy bug from pre-fix seed-dev), prefer
+  // the one with the most mentions so we keep the populated record
+  // and reset password on ALL duplicates so login is idempotent.
+  const existing = await pool.query(`
+    SELECT c.id, COALESCE(m.n, 0)::int AS mention_count
+    FROM customers c
+    LEFT JOIN (SELECT customer_id, COUNT(*) AS n FROM mentions GROUP BY customer_id) m ON m.customer_id = c.id
+    WHERE c.name = $1
+    ORDER BY mention_count DESC, c.created_at ASC
+  `, [DEV_CUSTOMER.name]);
   let customerId;
   if (existing.rowCount > 0) {
     customerId = existing.rows[0].id;
-    await pool.query('UPDATE customers SET password_hash = $2 WHERE id = $1', [customerId, passwordHash]);
-    console.log('[seed] customer exists (password reset):', customerId);
+    // Reset password on every duplicate so login works whichever gets picked.
+    await pool.query('UPDATE customers SET password_hash = $1 WHERE name = $2', [passwordHash, DEV_CUSTOMER.name]);
+    console.log('[seed] customer exists (using id with most mentions):', customerId, '— mentions:', existing.rows[0].mention_count);
+    if (existing.rowCount > 1) {
+      console.log('[seed] WARN —', existing.rowCount, 'duplicate dev customers. Run /api/_smoke/cleanup-duplicates if needed.');
+    }
   } else {
     const ins = await pool.query(`
       INSERT INTO customers (name, contact_email, alert_email, digest_email, status, password_hash)

@@ -178,9 +178,15 @@ function build(pool) {
     try {
       // Match by ANY of contact_email / alert_email / digest_email — campaign teams
       // share one shared password but multiple staff emails.
+      // Require password_hash to defend against unprovisioned rows.
+      // If multiple customers match, prefer the most-recently-active by mentions.
       const q = await pool.query(`
-        SELECT id, password_hash FROM customers
-        WHERE LOWER(contact_email) = $1 OR LOWER(alert_email) = $1 OR LOWER(digest_email) = $1
+        SELECT c.id, c.password_hash
+        FROM customers c
+        LEFT JOIN (SELECT customer_id, MAX(ingested_at) AS last_at FROM mentions GROUP BY customer_id) m ON m.customer_id = c.id
+        WHERE c.password_hash IS NOT NULL
+          AND (LOWER(c.contact_email) = $1 OR LOWER(c.alert_email) = $1 OR LOWER(c.digest_email) = $1)
+        ORDER BY m.last_at DESC NULLS LAST, c.created_at DESC
         LIMIT 1
       `, [email]);
       if (!q.rowCount || !q.rows[0].password_hash) return res.redirect(`/login?err=1&next=${encodeURIComponent(next)}`);
