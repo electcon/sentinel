@@ -24,7 +24,7 @@ const MODEL_ESCALATE = process.env.ANTHROPIC_MODEL_ESCALATE || 'claude-sonnet-4-
 // classifications.prompt_v audit trail can show which rubric a tier
 // was decided under.
 const TAXONOMY = fs.readFileSync(path.join(__dirname, 'THREAT_TAXONOMY.md'), 'utf8');
-const PROMPT_V = 'tax-v1.1';
+const PROMPT_V = 'tax-v1.2';
 
 const SYSTEM = `You are a threat-classification model for Sentinel, a defensive
 monitoring tool used by Democratic and Indy-aligned political campaigns.
@@ -33,7 +33,12 @@ Your job: read a single piece of social-media content that mentions a
 campaign target (candidate, family member, or staff) and classify it
 against the 4-tier rubric below.
 
-You MUST return JSON only, in the exact shape:
+You MUST return a single JSON object — and NOTHING ELSE. No code
+fences, no markdown, no "Reasoning:" section, no commentary before
+or after. Anything outside the JSON object will be discarded and
+treated as a parse failure.
+
+Shape:
   {"tier":1|2|3|4,"confidence":0.0-1.0,"sentiment":-2..2,"rationale":"<=200 chars"}
 
 Conservative bias: when a piece is borderline, escalate one tier higher.
@@ -92,11 +97,13 @@ async function _call(model, userPrompt, opts) {
     messages: [{ role: 'user', content: userPrompt }]
   });
   const text = (res.content || []).map(b => b.type === 'text' ? b.text : '').join('').trim();
-  // Strip code-fences if the model wrapped output.
-  const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '');
+  // Extract the first balanced JSON object. Robust to: code fences
+  // (```json ... ```), leading/trailing prose, and trailing markdown
+  // sections (e.g. "**Reasoning:**...") that some models append.
   let parsed;
+  const jsonStr = extractFirstJsonObject(text);
   try {
-    parsed = JSON.parse(cleaned);
+    parsed = JSON.parse(jsonStr);
   } catch (e) {
     // If the model returned non-JSON, escalate to a tier-2 human review
     // rather than guess. Caller logs and queues for manual classification.
@@ -128,7 +135,35 @@ async function _call(model, userPrompt, opts) {
   };
 }
 
-module.exports = { classify, classifyEscalated, PROMPT_V };
+// Scan `text` for the first `{...}` block with balanced braces, ignoring
+// braces that appear inside string literals. Returns the matched substring
+// or '' if no balanced object found.
+function extractFirstJsonObject(text) {
+  if (!text) return '';
+  const start = text.indexOf('{');
+  if (start < 0) return '';
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) { esc = false; continue; }
+      if (c === '\\') { esc = true; continue; }
+      if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return '';
+}
+
+module.exports = { classify, classifyEscalated, PROMPT_V, extractFirstJsonObject };
 
 // CLI smoke test:
 //   ANTHROPIC_API_KEY=... node classify.js "I'll be at her event Saturday."
