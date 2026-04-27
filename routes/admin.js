@@ -7,6 +7,7 @@
 
 const crypto = require('crypto');
 const express = require('express');
+const { hashPassword } = require('../lib/auth');
 
 function escapeHtml(s) {
   return String(s == null ? '' : s)
@@ -78,6 +79,7 @@ function adminPage(title, body) {
   <div class="brand">SENTINEL · admin</div>
   <a href="/admin">overview</a>
   <a href="/admin/customers">customers</a>
+  <a href="/admin/provision">+ provision</a>
   <a href="/admin/workers">workers</a>
   <a href="/admin/errors">errors</a>
   <a href="/admin/threats">threats</a>
@@ -162,6 +164,7 @@ function build(pool) {
 
   // ── /admin/customers ──────────────────────────────────────────────
   r.get('/admin/customers', gate, async (req, res) => {
+    const flash = req.query.ok ? `<div style="background:#1a4a1a;color:#7fff7f;padding:10px;margin-bottom:14px;border-radius:4px">${escapeHtml(req.query.ok)}</div>` : '';
     const r2 = await pool.query(`
       SELECT c.*, COALESCE(t.n, 0)::int AS target_count,
              COALESCE(m.n, 0)::int AS mention_count
@@ -186,6 +189,8 @@ function build(pool) {
     `).join('');
     const body = `
       <h1>Customers</h1>
+      ${flash}
+      <div style="margin:14px 0"><a href="/admin/provision"><button style="background:#4f9af0;color:#fff;border:0;padding:8px 14px;border-radius:4px;cursor:pointer;font-size:13px">+ Provision new customer</button></a></div>
       <table>
         <thead><tr><th>Name / ID</th><th>Status</th><th>Targets</th><th>Mentions</th><th>Contact</th><th>Alert</th><th>Digest</th><th>Created</th><th>PW</th><th></th></tr></thead>
         <tbody>${rows}</tbody>
@@ -213,10 +218,12 @@ function build(pool) {
     const targetRows = targets.rows.map(t => `<tr><td>${escapeHtml(t.kind)}</td><td>${escapeHtml(t.name)}</td><td class="muted">${escapeHtml((t.aliases || []).join(', '))}</td><td class="muted">${escapeHtml((t.search_terms || []).join(', '))}</td></tr>`).join('');
     const mentionRows = recent.rows.map(m => `<tr><td>T${m.threat_tier || '—'}</td><td>${escapeHtml(m.target_name || '—')}</td><td>${escapeHtml(m.source)}</td><td>${escapeHtml((m.body_excerpt || '').slice(0, 120))}</td><td class="muted">${ago(m.posted_at)}</td></tr>`).join('');
 
+    const flash = req.query.ok ? `<div style="background:#1a4a1a;color:#7fff7f;padding:10px;margin-bottom:14px;border-radius:4px">${escapeHtml(req.query.ok)}</div>` : '';
     const body = `
       <a href="/admin/customers" class="muted">← all customers</a>
       <h1 style="margin-top:14px">${escapeHtml(cust.name)}</h1>
       <div class="muted">${escapeHtml(cust.id)}</div>
+      ${flash}
       <div class="card" style="margin-top:14px">
         <div class="muted">contact: ${escapeHtml(cust.contact_email)}</div>
         <div class="muted">alert: ${escapeHtml(cust.alert_email)}</div>
@@ -271,6 +278,122 @@ function build(pool) {
       ${q.rowCount ? `<table><thead><tr><th>Worker</th><th>When</th><th>Duration</th><th>Error</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="muted">No errors logged.</div>'}`;
     res.set('Content-Type', 'text/html; charset=utf-8');
     res.send(adminPage('errors', body));
+  });
+
+  // ── /admin/provision (create or update customer via web form) ────
+  r.get('/admin/provision', gate, (req, res) => {
+    const flash = req.query.ok ? `<div style="background:#1a4a1a;color:#7fff7f;padding:10px;margin-bottom:14px;border-radius:4px">${escapeHtml(req.query.ok)}</div>` : '';
+    const err = req.query.err ? `<div style="background:#5e0e16;color:#fff;padding:10px;margin-bottom:14px;border-radius:4px">${escapeHtml(req.query.err)}</div>` : '';
+    const body = `
+      <a href="/admin" style="color:#8b949e;font-size:13px">← admin overview</a>
+      <h1 style="margin-top:14px">Provision customer</h1>
+      <p style="color:#8b949e;font-size:13px">Idempotent: if a customer with the same name exists, this updates it (preserves mentions/threats).</p>
+      ${flash}${err}
+      <form method="POST" action="/admin/provision">
+        <div style="margin-bottom:14px">
+          <label style="display:block;color:#8b949e;font-size:13px;margin-bottom:6px">Customer name (e.g., "Jolly for Governor")</label>
+          <input type="text" name="name" required style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:14px">
+        </div>
+        <div style="margin-bottom:14px">
+          <label style="display:block;color:#8b949e;font-size:13px;margin-bottom:6px">Contact email (used for login)</label>
+          <input type="email" name="contact_email" required style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:14px">
+        </div>
+        <div style="margin-bottom:14px">
+          <label style="display:block;color:#8b949e;font-size:13px;margin-bottom:6px">Alert email (tier 3+ real-time)</label>
+          <input type="email" name="alert_email" required style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:14px">
+        </div>
+        <div style="margin-bottom:14px">
+          <label style="display:block;color:#8b949e;font-size:13px;margin-bottom:6px">Digest email (daily summary)</label>
+          <input type="email" name="digest_email" required style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:14px">
+        </div>
+        <div style="margin-bottom:14px">
+          <label style="display:block;color:#8b949e;font-size:13px;margin-bottom:6px">Password (≥ 8 chars; tell customer to change on first login)</label>
+          <input type="text" name="password" required minlength="8" style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:14px;font-family:monospace">
+        </div>
+        <div style="margin-bottom:14px">
+          <label style="display:block;color:#8b949e;font-size:13px;margin-bottom:6px">Status</label>
+          <select name="status" style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:14px">
+            <option value="beta">beta</option>
+            <option value="active">active</option>
+            <option value="paused">paused</option>
+          </select>
+        </div>
+        <div style="margin-bottom:14px">
+          <label style="display:block;color:#8b949e;font-size:13px;margin-bottom:6px">Targets — one per line OR JSON array</label>
+          <textarea name="targets" rows="10" placeholder='Either:&#10;Cinde Warmington&#10;Tom Sherman (her partner)&#10;&#10;Or:&#10;[&#10;  {"kind":"candidate","name":"Cinde Warmington","aliases":["Warmington"],"search_terms":["Cinde Warmington"]},&#10;  {"kind":"family","name":"Tom Sherman"}&#10;]' style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:13px;font-family:monospace"></textarea>
+        </div>
+        <button type="submit" style="background:#4f9af0;color:#fff;border:0;padding:10px 20px;border-radius:4px;font-size:14px;cursor:pointer">Provision</button>
+      </form>
+    `;
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(adminPage('Provision customer', body));
+  });
+
+  r.post('/admin/provision', gate, express.urlencoded({ extended: false, limit: '256kb' }), async (req, res) => {
+    try {
+      const { name, contact_email, alert_email, digest_email, password, status } = req.body;
+      if (!name || !contact_email || !alert_email || !digest_email || !password) {
+        return res.redirect('/admin/provision?err=' + encodeURIComponent('All fields required'));
+      }
+      if (password.length < 8) {
+        return res.redirect('/admin/provision?err=' + encodeURIComponent('Password must be ≥ 8 chars'));
+      }
+      const useStatus = ['beta', 'active', 'paused'].includes(status) ? status : 'beta';
+
+      // Parse targets: JSON array or one-name-per-line.
+      const targetsText = String(req.body.targets || '').trim();
+      let targets = [];
+      if (targetsText.startsWith('[') || targetsText.startsWith('{')) {
+        try {
+          const parsed = JSON.parse(targetsText);
+          targets = (Array.isArray(parsed) ? parsed : [parsed]).filter(t => t && t.name);
+        } catch (e) {
+          return res.redirect('/admin/provision?err=' + encodeURIComponent('Invalid JSON: ' + e.message.slice(0, 80)));
+        }
+      } else if (targetsText) {
+        targets = targetsText.split(/\r?\n/).map(l => l.trim()).filter(Boolean).map(name => ({ kind: 'candidate', name, aliases: [], search_terms: [name] }));
+      }
+      if (!targets.length) {
+        return res.redirect('/admin/provision?err=' + encodeURIComponent('At least one target required'));
+      }
+
+      // Ensure schema (idempotent in case the column was added recently).
+      await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS password_hash TEXT`);
+      await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS targets_customer_name ON targets (customer_id, name)`);
+
+      const passwordHash = await hashPassword(password);
+
+      const existing = await pool.query('SELECT id FROM customers WHERE name = $1 LIMIT 1', [name]);
+      let customerId;
+      if (existing.rowCount > 0) {
+        customerId = existing.rows[0].id;
+        await pool.query(`UPDATE customers SET contact_email=$2, alert_email=$3, digest_email=$4, status=$5, password_hash=$6 WHERE id=$1`,
+          [customerId, contact_email, alert_email, digest_email, useStatus, passwordHash]);
+      } else {
+        const ins = await pool.query(`INSERT INTO customers (name, contact_email, alert_email, digest_email, status, password_hash) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+          [name, contact_email, alert_email, digest_email, useStatus, passwordHash]);
+        customerId = ins.rows[0].id;
+      }
+      let created = 0, updated = 0;
+      for (const t of targets) {
+        const kindRaw = String(t.kind || 'candidate').trim();
+        const kind = ['candidate', 'family', 'staff', 'surrogate'].includes(kindRaw) ? kindRaw : 'candidate';
+        const aliases = Array.isArray(t.aliases) ? t.aliases : [];
+        const searchTerms = Array.isArray(t.search_terms) ? t.search_terms : [t.name];
+        const r2 = await pool.query(`
+          INSERT INTO targets (customer_id, kind, name, aliases, search_terms)
+          VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
+          ON CONFLICT (customer_id, name) DO UPDATE
+          SET kind = EXCLUDED.kind, aliases = EXCLUDED.aliases, search_terms = EXCLUDED.search_terms
+          RETURNING (xmax = 0) AS inserted
+        `, [customerId, kind, t.name, JSON.stringify(aliases), JSON.stringify(searchTerms)]);
+        if (r2.rows[0].inserted) created++; else updated++;
+      }
+      const note = `${existing.rowCount > 0 ? 'updated' : 'created'} customer; ${created} new + ${updated} updated targets. Send credentials to ${contact_email} via secure channel.`;
+      res.redirect(`/admin/customers/${customerId}?ok=` + encodeURIComponent(note));
+    } catch (e) {
+      res.redirect('/admin/provision?err=' + encodeURIComponent(e.message.slice(0, 200)));
+    }
   });
 
   // ── /admin/threats ────────────────────────────────────────────────
