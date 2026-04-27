@@ -44,6 +44,7 @@ async function runOnce({ pool, log = console.log, force = false }) {
   `, [force, MIN_GAP_HOURS]);
 
   let sent = 0; let dryRun = 0; let failed = 0; let skipped = 0;
+  const errorDetails = [];
   for (const c of due.rows) {
     const data = await rollupForCustomer(pool, c.id);
     if (data.totalMentions === 0 && data.openThreats === 0 && data.reviewQueue.pending === 0 && !force) {
@@ -56,13 +57,18 @@ async function runOnce({ pool, log = console.log, force = false }) {
 
     const out = await sendDigest({ customer: { id: c.id, name: c.name }, to: c.digest_email, data: { customer: { id: c.id, name: c.name }, ...data } });
     if (out.dryRun) dryRun++;
-    if (!out.ok) { failed++; log(`[digest] FAILED for ${c.name}: ${out.error}`); continue; }
+    if (!out.ok) {
+      failed++;
+      errorDetails.push({ customer: c.name, error: (out.error || 'unknown').slice(0, 300) });
+      log(`[digest] FAILED for ${c.name}: ${out.error}`);
+      continue;
+    }
     log(`[digest] sent → ${c.digest_email}${out.dryRun ? ' (dry-run)' : ''}`);
     sent++;
     await pool.query('UPDATE customers SET last_digest_at = NOW() WHERE id = $1', [c.id]);
   }
 
-  return { evaluated: due.rowCount, sent, dry_run: dryRun, failed, no_activity: skipped };
+  return { evaluated: due.rowCount, sent, dry_run: dryRun, failed, no_activity: skipped, error_details: errorDetails.slice(0, 5) };
 }
 
 async function rollupForCustomer(pool, customerId) {
