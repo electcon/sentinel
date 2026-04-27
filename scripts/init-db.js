@@ -102,6 +102,37 @@ async function initSchema(pool) {
     )
   `);
 
+  // Classifier feedback. Every reviewer disposition (Tier-2 review queue
+  // action OR Tier-3+ threat_event status change) is captured here as
+  // ground-truth for drift detection + future prompt tuning.
+  // reviewer_action vocabulary:
+  //   - 'dismissed'         (review-queue OR threats: false positive in our judgment)
+  //   - 'escalated'         (review-queue: bumped Tier-2 → 3)
+  //   - 'ongoing_campaign'  (review-queue: real but trend-tracked, not actionable)
+  //   - 'reviewing'         (threats: human is investigating)
+  //   - 'reported_platform' (threats: confirmed, reported to platform)
+  //   - 'reported_law_enf'  (threats: confirmed, escalated to LE)
+  //   - 'monitoring'        (threats: confirmed but not acting on yet)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS classifier_feedback (
+      id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      mention_id            UUID NOT NULL REFERENCES mentions(id),
+      customer_id           UUID NOT NULL REFERENCES customers(id),
+      original_tier         SMALLINT,
+      original_confidence   NUMERIC,
+      original_model        TEXT,
+      original_prompt_v     TEXT,
+      reviewer_action       TEXT NOT NULL,
+      reviewer_actor        TEXT,
+      reviewer_note         TEXT,
+      source                TEXT,
+      target_kind           TEXT,
+      created_at            TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS classifier_feedback_recent ON classifier_feedback (created_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS classifier_feedback_source_action ON classifier_feedback (source, reviewer_action, created_at DESC)`);
+
   // Per-tick worker run log. Lets the dashboard show "last ran X
   // minutes ago, processed N items, errored Y times." Old rows
   // pruned by a periodic VACUUM-style cleanup; for now we keep ~7d.

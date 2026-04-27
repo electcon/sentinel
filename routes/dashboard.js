@@ -22,6 +22,41 @@ const {
 } = require('../lib/auth');
 const { sendThreatAlert, generateWebhookSecret } = require('../lib/alert');
 
+// Capture a reviewer disposition into classifier_feedback. Best-effort —
+// log failures but don't block the action. Called from both the
+// review-queue action POST and the threats action POST.
+async function recordClassifierFeedback(pool, { mentionId, customerId, action, actor, note }) {
+  try {
+    const m = await pool.query(`
+      SELECT m.threat_tier, m.classifier_v, m.source, t.kind AS target_kind
+      FROM mentions m
+      LEFT JOIN targets t ON t.id = m.target_id
+      WHERE m.id = $1 AND m.customer_id = $2
+      LIMIT 1
+    `, [mentionId, customerId]);
+    if (!m.rowCount) return;
+    const c = await pool.query(`
+      SELECT model, confidence FROM classifications
+      WHERE mention_id = $1 ORDER BY created_at DESC LIMIT 1
+    `, [mentionId]);
+    await pool.query(`
+      INSERT INTO classifier_feedback (
+        mention_id, customer_id,
+        original_tier, original_confidence, original_model, original_prompt_v,
+        reviewer_action, reviewer_actor, reviewer_note,
+        source, target_kind
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    `, [
+      mentionId, customerId,
+      m.rows[0].threat_tier, c.rows[0]?.confidence ?? null, c.rows[0]?.model ?? null, m.rows[0].classifier_v,
+      action, actor, (note || '').slice(0, 1000),
+      m.rows[0].source, m.rows[0].target_kind
+    ]);
+  } catch (e) {
+    console.error('[classifier_feedback] write failed:', e.message);
+  }
+}
+
 function escapeHtml(s) {
   return String(s == null ? '' : s)
     .replace(/&/g, '&amp;')
@@ -543,6 +578,20 @@ function build(pool) {
           notes = CASE WHEN notes IS NULL OR notes = '' THEN $4 ELSE notes || E'\\n' || $4 END
       WHERE id = $1 AND customer_id = $5
     `, [req.params.id, newStatus, isResolved, entry, req.customer.id]);
+
+    // Capture as classifier feedback (ground truth for drift detection).
+    // Look up the underlying mention so we record against it, not the threat_event.
+    const ev = await pool.query('SELECT mention_id FROM threat_events WHERE id = $1 AND customer_id = $2', [req.params.id, req.customer.id]);
+    if (ev.rowCount) {
+      await recordClassifierFeedback(pool, {
+        mentionId: ev.rows[0].mention_id,
+        customerId: req.customer.id,
+        action: newStatus,
+        actor,
+        note
+      });
+    }
+
     res.redirect(`/dashboard/threats/${req.params.id}`);
   });
 
@@ -920,6 +969,9 @@ function build(pool) {
           review_notes = CASE WHEN review_notes IS NULL OR review_notes = '' THEN $4 ELSE review_notes || E'\\n' || $4 END
       WHERE id = $1 AND customer_id = $5
     `, [req.params.id, action, actor, entry, req.customer.id]);
+
+    // Capture as classifier feedback (ground truth for drift detection).
+    await recordClassifierFeedback(pool, { mentionId: req.params.id, customerId: req.customer.id, action, actor, note });
 
     // If escalated, create a tier-3 threat_event so the alert worker
     // picks it up. Idempotent: skip if one already exists.

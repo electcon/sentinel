@@ -83,6 +83,7 @@ function adminPage(title, body) {
   <a href="/admin/workers">workers</a>
   <a href="/admin/errors">errors</a>
   <a href="/admin/threats">threats</a>
+  <a href="/admin/classifier-quality">classifier</a>
 </div>
 <div class="container">
 ${body}
@@ -412,6 +413,147 @@ function build(pool) {
     } catch (e) {
       res.redirect('/admin/provision?err=' + encodeURIComponent(e.message.slice(0, 200)));
     }
+  });
+
+  // ── /admin/classifier-quality ─────────────────────────────────────
+  // Drift dashboard: shows reviewer-action distribution per source +
+  // per original-tier, with dismissal-rate callouts when classifier
+  // appears to be over-calling. Last 30 days.
+  r.get('/admin/classifier-quality', gate, async (req, res) => {
+    const [bySource, byTier, recent, totals] = await Promise.all([
+      pool.query(`
+        SELECT source, reviewer_action, COUNT(*)::int AS n
+        FROM classifier_feedback
+        WHERE created_at >= NOW() - INTERVAL '30 days'
+        GROUP BY 1, 2
+        ORDER BY 1, 2
+      `),
+      pool.query(`
+        SELECT original_tier, reviewer_action, COUNT(*)::int AS n
+        FROM classifier_feedback
+        WHERE created_at >= NOW() - INTERVAL '30 days'
+        GROUP BY 1, 2
+        ORDER BY 1, 2
+      `),
+      pool.query(`
+        SELECT cf.created_at, cf.original_tier, cf.original_confidence, cf.reviewer_action,
+               cf.reviewer_actor, cf.reviewer_note, cf.source, m.body_excerpt, c.name AS customer_name
+        FROM classifier_feedback cf
+        JOIN mentions m ON m.id = cf.mention_id
+        JOIN customers c ON c.id = cf.customer_id
+        ORDER BY cf.created_at DESC
+        LIMIT 30
+      `),
+      pool.query(`
+        SELECT COUNT(*)::int AS total,
+               COUNT(*) FILTER (WHERE reviewer_action = 'dismissed')::int AS dismissed,
+               COUNT(*) FILTER (WHERE reviewer_action = 'escalated')::int AS escalated,
+               COUNT(*) FILTER (WHERE reviewer_action = 'ongoing_campaign')::int AS ongoing,
+               COUNT(*) FILTER (WHERE reviewer_action IN ('reported_platform','reported_law_enf'))::int AS reported,
+               COUNT(*) FILTER (WHERE reviewer_action = 'monitoring')::int AS monitoring
+        FROM classifier_feedback
+        WHERE created_at >= NOW() - INTERVAL '30 days'
+      `)
+    ]);
+
+    // Build per-source pivot: for each source, count by action.
+    const sourcePivot = {};
+    for (const r2 of bySource.rows) {
+      if (!sourcePivot[r2.source]) sourcePivot[r2.source] = { dismissed: 0, escalated: 0, ongoing_campaign: 0, reviewing: 0, reported_platform: 0, reported_law_enf: 0, monitoring: 0, total: 0 };
+      sourcePivot[r2.source][r2.reviewer_action] = r2.n;
+      sourcePivot[r2.source].total += r2.n;
+    }
+    const sourceRows = Object.entries(sourcePivot).map(([source, p]) => {
+      const dismissalRate = p.total > 0 ? Math.round((p.dismissed / p.total) * 100) : 0;
+      const drift = dismissalRate >= 60;
+      return `<tr>
+        <td><strong>${escapeHtml(source)}</strong></td>
+        <td>${p.total}</td>
+        <td>${p.dismissed}</td>
+        <td>${p.escalated || 0}</td>
+        <td>${p.ongoing_campaign || 0}</td>
+        <td>${(p.reported_platform || 0) + (p.reported_law_enf || 0)}</td>
+        <td>${p.monitoring || 0}</td>
+        <td><span class="pill ${drift ? 'err' : 'ok'}">${dismissalRate}%</span></td>
+      </tr>`;
+    }).join('');
+
+    // Tier pivot: original_tier × reviewer_action.
+    const tierPivot = {};
+    for (const r2 of byTier.rows) {
+      const t = r2.original_tier || 0;
+      if (!tierPivot[t]) tierPivot[t] = { dismissed: 0, escalated: 0, ongoing_campaign: 0, reviewing: 0, reported_platform: 0, reported_law_enf: 0, monitoring: 0, total: 0 };
+      tierPivot[t][r2.reviewer_action] = r2.n;
+      tierPivot[t].total += r2.n;
+    }
+    const tierRows = Object.entries(tierPivot).sort(([a], [b]) => Number(b) - Number(a)).map(([tier, p]) => {
+      const dismissalRate = p.total > 0 ? Math.round((p.dismissed / p.total) * 100) : 0;
+      return `<tr>
+        <td><strong>Tier ${tier}</strong></td>
+        <td>${p.total}</td>
+        <td>${p.dismissed}</td>
+        <td>${p.escalated || 0}</td>
+        <td>${p.ongoing_campaign || 0}</td>
+        <td>${(p.reported_platform || 0) + (p.reported_law_enf || 0)}</td>
+        <td>${dismissalRate}%</td>
+      </tr>`;
+    }).join('');
+
+    const t = totals.rows[0];
+    const totalDismissalRate = t.total > 0 ? Math.round((t.dismissed / t.total) * 100) : 0;
+    const drift = totalDismissalRate >= 60 && t.total >= 10;
+
+    const recentRows = recent.rows.map(r2 => `
+      <tr>
+        <td class="muted">${ago(r2.created_at)}</td>
+        <td>T${r2.original_tier ?? '—'}${r2.original_confidence != null ? ` (${Number(r2.original_confidence).toFixed(2)})` : ''}</td>
+        <td>${escapeHtml(r2.source || '—')}</td>
+        <td><span class="pill ${r2.reviewer_action === 'dismissed' ? 'err' : 'ok'}">${escapeHtml(r2.reviewer_action)}</span></td>
+        <td>${escapeHtml(r2.customer_name)}</td>
+        <td class="muted" style="max-width:300px;overflow:hidden;text-overflow:ellipsis">${escapeHtml((r2.body_excerpt || '').slice(0, 120))}</td>
+        <td class="muted">${escapeHtml((r2.reviewer_note || '').slice(0, 80))}</td>
+      </tr>
+    `).join('');
+
+    const driftBanner = drift
+      ? `<div style="background:#3d301a;border-left:3px solid #d8902f;padding:10px 14px;margin:14px 0;font-size:13px">
+           <strong style="color:#d8902f">⚠ Drift watch:</strong> overall dismissal rate is ${totalDismissalRate}% over ${t.total} reviews (last 30d).
+           Classifier may be over-calling — consider tightening rubric examples for the high-dismissal source(s) below.
+         </div>` : '';
+
+    const body = `
+      <h1>Classifier quality</h1>
+      <div class="muted">Reviewer dispositions captured as ground-truth feedback. Last 30 days.</div>
+      ${driftBanner}
+
+      <div class="row" style="display:flex;gap:18px;margin:18px 0;flex-wrap:wrap">
+        <div class="card" style="flex:1 1 140px;min-width:120px"><div class="muted">Total reviews</div><div style="font-size:28px;font-weight:600">${t.total}</div></div>
+        <div class="card" style="flex:1 1 140px;min-width:120px"><div class="muted">Dismissed</div><div style="font-size:28px;font-weight:600">${t.dismissed}</div></div>
+        <div class="card" style="flex:1 1 140px;min-width:120px"><div class="muted">Escalated</div><div style="font-size:28px;font-weight:600">${t.escalated}</div></div>
+        <div class="card" style="flex:1 1 140px;min-width:120px"><div class="muted">Reported</div><div style="font-size:28px;font-weight:600">${t.reported}</div></div>
+        <div class="card" style="flex:1 1 140px;min-width:120px"><div class="muted">Dismissal rate</div><div style="font-size:28px;font-weight:600">${totalDismissalRate}%</div></div>
+      </div>
+
+      <h2>By source</h2>
+      ${sourceRows ? `<table>
+        <thead><tr><th>Source</th><th>Total</th><th>Dismissed</th><th>Escalated</th><th>Ongoing</th><th>Reported</th><th>Monitoring</th><th>Dismissal %</th></tr></thead>
+        <tbody>${sourceRows}</tbody>
+      </table>` : '<div class="muted">No feedback yet.</div>'}
+
+      <h2>By original tier</h2>
+      ${tierRows ? `<table>
+        <thead><tr><th>Tier</th><th>Total</th><th>Dismissed</th><th>Escalated</th><th>Ongoing</th><th>Reported</th><th>Dismissal %</th></tr></thead>
+        <tbody>${tierRows}</tbody>
+      </table>` : '<div class="muted">No feedback yet.</div>'}
+
+      <h2>Recent decisions</h2>
+      ${recentRows ? `<table>
+        <thead><tr><th>When</th><th>Original</th><th>Source</th><th>Action</th><th>Customer</th><th>Excerpt</th><th>Note</th></tr></thead>
+        <tbody>${recentRows}</tbody>
+      </table>` : '<div class="muted">No feedback yet.</div>'}
+    `;
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(adminPage('classifier quality', body));
   });
 
   // ── /admin/threats ────────────────────────────────────────────────
