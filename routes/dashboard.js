@@ -157,7 +157,7 @@ ${flashBanner}
 <div class="container">
 ${body}
 </div>
-<footer>Sentinel is a monitoring tool, not a security service. Best-effort classification can miss credible threats. Customers retain responsibility for security posture and law-enforcement coordination.</footer>
+<footer>Sentinel · a product of Parallax Advisory LLC · monitoring tool, not a security service. Best-effort classification can miss credible threats. Customers retain responsibility for security posture and law-enforcement coordination.</footer>
 </body></html>`;
 }
 

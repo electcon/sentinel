@@ -402,7 +402,7 @@ app.get('/status', async (req, res) => {
 ${s.workers.length ? s.workers.map(w => `<div class="row">${dot(w.last_run_ok)}<span>${escapeHtml(w.name)}</span><span class="muted">${ago(w.seconds_since)} · ${w.last_run_ms || 0}ms</span></div>`).join('') : '<div class="muted">No worker runs logged yet (system just booted).</div>'}
 <h2 style="margin-top:32px">About</h2>
 <div class="muted">
-Sentinel is a defensive social-media + threat-monitoring platform for Democratic and Indy-aligned political campaigns.
+Sentinel — a product of Parallax Advisory LLC. Defensive social-media + threat-monitoring for Democratic and Indy-aligned political campaigns.
 This page reports operational health only — no customer data is exposed.
 </div>
 </body></html>`);

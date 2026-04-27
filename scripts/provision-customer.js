@@ -130,7 +130,7 @@ async function main() {
 async function sendWelcomeEmail({ spec, loginUrl }) {
   const { Resend } = require('resend');
   const resend = new Resend(process.env.RESEND_API_KEY);
-  const from = process.env.WELCOME_FROM_EMAIL || 'Sentinel <hello@voteroi.com>';
+  const from = process.env.WELCOME_FROM_EMAIL || 'Sentinel <hello@parallaxadvisory.llc>';
   const text = [
     `Hi — welcome to Sentinel.`,
     ``,
@@ -150,7 +150,8 @@ async function sendWelcomeEmail({ spec, loginUrl }) {
     ``,
     `If anything looks wrong, reply to this email.`,
     ``,
-    `— David Wheeler, Sentinel`
+    `— David Wheeler`,
+    `Sentinel · a product of Parallax Advisory LLC`
   ].join('\n');
   const html = `<div style="font-family:Inter,system-ui,sans-serif;max-width:560px;margin:0 auto;color:#0a0f1a;line-height:1.5">
     <h2>Welcome to Sentinel</h2>
@@ -165,7 +166,8 @@ async function sendWelcomeEmail({ spec, loginUrl }) {
     <p><strong>Targets monitored:</strong></p>
     <ul>${(spec.targets || []).map(t => `<li>${t.name} <span style="color:#666;font-size:13px">(${t.kind || 'candidate'})</span></li>`).join('')}</ul>
     <p>Reply to this email if anything looks wrong.</p>
-    <p>— David Wheeler, Sentinel</p>
+    <p>— David Wheeler<br>
+    <span style="color:#666;font-size:13px">Sentinel · a product of Parallax Advisory LLC</span></p>
   </div>`;
   const r = await resend.emails.send({ from, to: spec.contact_email, subject: `Welcome to Sentinel — ${spec.name}`, text, html });
   if (r.error) throw new Error(r.error.message || JSON.stringify(r.error));
