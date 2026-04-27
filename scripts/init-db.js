@@ -93,6 +93,23 @@ async function initSchema(pool) {
     )
   `);
 
+  // Per-tick worker run log. Lets the dashboard show "last ran X
+  // minutes ago, processed N items, errored Y times." Old rows
+  // pruned by a periodic VACUUM-style cleanup; for now we keep ~7d.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS worker_runs (
+      id            BIGSERIAL PRIMARY KEY,
+      worker_name   TEXT NOT NULL,
+      started_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      finished_at   TIMESTAMPTZ,
+      duration_ms   INTEGER,
+      ok            BOOLEAN,
+      summary       JSONB,
+      error         TEXT
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS worker_runs_recent ON worker_runs (worker_name, started_at DESC)`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS alert_routes (
       id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),

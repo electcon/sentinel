@@ -368,14 +368,23 @@ async function runWithGuard(s) {
     return;
   }
   _running.add(s.name);
+  const startedAt = new Date();
   const t0 = Date.now();
+  let ok = false; let out = null; let err = null;
   try {
-    const out = await s.run();
+    out = await s.run();
+    ok = true;
     console.log(`[sched ${s.name}] ${Date.now() - t0}ms`, JSON.stringify(out));
   } catch (e) {
+    err = e.message;
     console.error(`[sched ${s.name}] FAILED after ${Date.now() - t0}ms: ${e.message}`);
   } finally {
     _running.delete(s.name);
+    // Best-effort run log; don't propagate DB errors as scheduler errors.
+    pool.query(`
+      INSERT INTO worker_runs (worker_name, started_at, finished_at, duration_ms, ok, summary, error)
+      VALUES ($1, $2, NOW(), $3, $4, $5::jsonb, $6)
+    `, [s.name, startedAt, Date.now() - t0, ok, out ? JSON.stringify(out) : null, err]).catch(() => {});
   }
 }
 

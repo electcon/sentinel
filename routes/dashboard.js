@@ -208,6 +208,17 @@ function build(pool) {
   r.get('/dashboard', auth, async (req, res) => {
     const customerId = req.customer.id;
 
+    // Per-worker most-recent run, for the system-health panel.
+    const workerNames = ['reddit', 'bluesky', 'rss', 'x', 'alert', 'digest'];
+    const workerHealth = await pool.query(`
+      SELECT DISTINCT ON (worker_name) worker_name, started_at, finished_at, duration_ms, ok, summary, error
+      FROM worker_runs
+      WHERE worker_name = ANY($1)
+      ORDER BY worker_name, started_at DESC
+    `, [workerNames]);
+    const workerByName = {};
+    for (const w of workerHealth.rows) workerByName[w.worker_name] = w;
+
     const [threats, recent, counts] = await Promise.all([
       pool.query(`
         SELECT te.id, te.tier, te.status, te.created_at, te.alerted_at,
@@ -264,6 +275,28 @@ function build(pool) {
       </tr>
     `).join('');
 
+    const ago = (d) => {
+      if (!d) return 'never';
+      const ms = Date.now() - new Date(d).getTime();
+      if (ms < 60_000) return Math.floor(ms / 1000) + 's ago';
+      if (ms < 3_600_000) return Math.floor(ms / 60_000) + 'm ago';
+      if (ms < 86_400_000) return Math.floor(ms / 3_600_000) + 'h ago';
+      return Math.floor(ms / 86_400_000) + 'd ago';
+    };
+    const healthChip = (name) => {
+      const w = workerByName[name];
+      if (!w) return `<span class="muted">${name}: never run</span>`;
+      const dotColor = w.ok ? '#3a9c3a' : '#a82a2a';
+      const summary = w.summary && typeof w.summary === 'object' ? w.summary : null;
+      const summaryBits = summary ? Object.entries(summary).filter(([k]) => !k.includes('_details')).map(([k, v]) => `${k}: ${v}`).join(' · ') : '';
+      return `<div style="display:flex;align-items:center;gap:8px;font-size:12px;padding:6px 0">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${dotColor}"></span>
+        <span style="color:#e6edf3;font-weight:500;width:64px">${escapeHtml(name)}</span>
+        <span class="muted">${ago(w.started_at)} · ${w.duration_ms || 0}ms${w.error ? ' · ERROR: ' + escapeHtml(w.error.slice(0, 80)) : ''}</span>
+        ${summaryBits ? `<span class="muted" style="margin-left:auto">${escapeHtml(summaryBits)}</span>` : ''}
+      </div>`;
+    };
+
     const body = `
       <h1>Overview</h1>
       <div class="muted">${escapeHtml(req.customer.name)} — last 24 hours</div>
@@ -279,6 +312,10 @@ function build(pool) {
           <div class="muted" style="margin-top:6px;font-size:12px">
             T4: ${tierCounts[4]} · T3: ${tierCounts[3]} · T2: ${tierCounts[2]} · T1: ${tierCounts[1]}
           </div>
+        </div>
+        <div class="card">
+          <div class="muted" style="margin-bottom:6px">System health</div>
+          ${workerNames.map(healthChip).join('')}
         </div>
       </div>
 
