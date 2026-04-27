@@ -162,10 +162,20 @@ function build(pool) {
            <strong style="color:#d8902f">⚠ Stale workers:</strong> ${staleWorkers.map(w => escapeHtml(w.worker_name)).join(', ')} —
            last run is older than 2× the expected interval. Investigate via the Errors tab or Render logs.
          </div>` : '';
+    const smokeOn = process.env.SMOKE_DISABLED !== 'true';
+    const smokeBanner = smokeOn
+      ? `<div style="background:#3d301a;border-left:3px solid #d8902f;padding:10px 14px;margin:14px 0;font-size:13px">
+           <strong style="color:#d8902f">⚠ Smoke endpoints enabled.</strong> /api/_smoke/* is reachable with the dev token.
+           Once you have real customers in production, set <code>SMOKE_DISABLED=true</code> on Render to lock these down.
+         </div>`
+      : `<div style="background:#1a4a1a;border-left:3px solid #3a9c3a;padding:10px 14px;margin:14px 0;font-size:13px">
+           <strong style="color:#7fff7f">✓ Smoke endpoints disabled</strong> (SMOKE_DISABLED=true). All /api/_smoke/* routes return 404.
+         </div>`;
     const body = `
       <h1>Sentinel — admin overview</h1>
       <div class="muted">${customers.rowCount} customer${customers.rowCount === 1 ? '' : 's'} · ${mentions24h.rows[0].n} mentions · ${threats24h.rows[0].n} threat events · ${errors24h.rows[0].n} worker errors (24h)</div>
       ${staleBanner}
+      ${smokeBanner}
 
       <h2>Customers</h2>
       ${customers.rowCount ? `<table>

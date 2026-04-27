@@ -74,10 +74,33 @@ app.get('/api/health', async (req, res) => {
 // All under /api/_smoke/* and removed once a real admin auth layer
 // lands in week 5.
 
+// Master kill switch: SMOKE_DISABLED=true disables all /api/_smoke/*
+// endpoints (404). Flip on Render once real customers are onboarded
+// and you no longer need to run ad-hoc tests via the dev token.
+function smokeEnabled() {
+  return process.env.SMOKE_DISABLED !== 'true';
+}
+
 function requireSmokeToken(req, res, next) {
+  if (!smokeEnabled()) return res.status(404).json({ error: 'not found' });
   const tok = req.get('x-smoke-token') || '';
   const expected = process.env.SMOKE_TOKEN || '';
   if (!expected || tok !== expected) return res.status(401).json({ error: 'bad token' });
+  next();
+}
+
+// High-risk smoke ops (sends real email, creates synthetic data,
+// cross-customer reads) require an additional ADMIN_PASSWORD via
+// X-Admin-Password header. Defense in depth: the smoke token alone
+// is not enough for these. Operator must supply both.
+function requireSmokeAdmin(req, res, next) {
+  if (!smokeEnabled()) return res.status(404).json({ error: 'not found' });
+  const tok = req.get('x-smoke-token') || '';
+  const pw = req.get('x-admin-password') || '';
+  const expectedTok = process.env.SMOKE_TOKEN || '';
+  const expectedPw = process.env.ADMIN_PASSWORD || '';
+  if (!expectedTok || tok !== expectedTok) return res.status(401).json({ error: 'bad token' });
+  if (!expectedPw || pw !== expectedPw) return res.status(401).json({ error: 'admin password required for this endpoint' });
   next();
 }
 
@@ -201,7 +224,8 @@ app.get('/api/_smoke/fbi-state-stats', requireSmokeToken, async (req, res) => {
 
 // Idempotent dev-customer seeder. POST to provision the test customer
 // and dev targets (Cinde Warmington, Eileen Laubacher, Charlie Crist).
-app.post('/api/_smoke/seed-dev', requireSmokeToken, async (req, res) => {
+// HIGH RISK — writes a customer with hardcoded password; admin gate.
+app.post('/api/_smoke/seed-dev', requireSmokeAdmin, async (req, res) => {
   try {
     const child_process = require('child_process');
     child_process.execFile(process.execPath, ['scripts/seed-dev.js'], { cwd: __dirname }, (err, stdout, stderr) => {
@@ -214,8 +238,8 @@ app.post('/api/_smoke/seed-dev', requireSmokeToken, async (req, res) => {
 });
 
 // Read most-recent mentions for inspection. Optional ?customer_name=foo
-// or ?tier=3 filters.
-app.get('/api/_smoke/mentions', requireSmokeToken, async (req, res) => {
+// or ?tier=3 filters. CROSS-CUSTOMER read — admin gate.
+app.get('/api/_smoke/mentions', requireSmokeAdmin, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
     const tierFilter = req.query.tier ? `AND m.threat_tier >= ${parseInt(req.query.tier, 10)}` : '';
@@ -237,7 +261,8 @@ app.get('/api/_smoke/mentions', requireSmokeToken, async (req, res) => {
 });
 
 // Trigger one digest sweep. Body: { force: true } bypasses the 23h gap.
-app.post('/api/_smoke/digest-run', requireSmokeToken, async (req, res) => {
+// HIGH RISK — sends real email if RESEND_API_KEY set; admin gate.
+app.post('/api/_smoke/digest-run', requireSmokeAdmin, async (req, res) => {
   try {
     const { runOnce } = require('./workers/digest');
     const force = !!(req.body && req.body.force);
@@ -248,8 +273,9 @@ app.post('/api/_smoke/digest-run', requireSmokeToken, async (req, res) => {
   }
 });
 
-// Trigger one alert sweep (sends emails for any open un-alerted tier-3+ events).
-app.post('/api/_smoke/alert-run', requireSmokeToken, async (req, res) => {
+// Trigger one alert sweep. HIGH RISK — sends real email + fires
+// customer-defined webhooks. Admin gate.
+app.post('/api/_smoke/alert-run', requireSmokeAdmin, async (req, res) => {
   try {
     const { runOnce } = require('./workers/alert');
     const summary = await runOnce({ pool, log: console.log });
@@ -261,7 +287,8 @@ app.post('/api/_smoke/alert-run', requireSmokeToken, async (req, res) => {
 
 // Inject a synthetic mention for the dev customer. Tier 2 → review queue,
 // tier 3/4 → threat_event for alert worker. Body: { tier?: 2|3|4 }
-app.post('/api/_smoke/inject-test-threat', requireSmokeToken, async (req, res) => {
+// HIGH RISK — creates fake customer data; admin gate.
+app.post('/api/_smoke/inject-test-threat', requireSmokeAdmin, async (req, res) => {
   try {
     const t = (req.body && req.body.tier);
     const tier = t === 2 ? 2 : t === 4 ? 4 : 3;
@@ -321,7 +348,8 @@ app.post('/api/_smoke/inject-test-threat', requireSmokeToken, async (req, res) =
 //   2. DELETE the other customers and their now-empty target rows
 // Bounded by name; idempotent. Used to clean up the legacy seed-dev
 // bug that produced two "Sentinel Dev (test)" customers.
-app.post('/api/_smoke/cleanup-duplicates', requireSmokeToken, async (req, res) => {
+// HIGH RISK — deletes data; admin gate.
+app.post('/api/_smoke/cleanup-duplicates', requireSmokeAdmin, async (req, res) => {
   try {
     const dups = await pool.query(`
       SELECT name, COUNT(*)::int AS n FROM customers GROUP BY name HAVING COUNT(*) > 1
@@ -372,8 +400,8 @@ app.post('/api/_smoke/cleanup-duplicates', requireSmokeToken, async (req, res) =
   }
 });
 
-// Open threat queue.
-app.get('/api/_smoke/threats', requireSmokeToken, async (req, res) => {
+// Open threat queue. CROSS-CUSTOMER read — admin gate.
+app.get('/api/_smoke/threats', requireSmokeAdmin, async (req, res) => {
   try {
     const r = await pool.query(`
       SELECT te.id, te.tier, te.status, te.created_at, te.alerted_at,

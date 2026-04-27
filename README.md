@@ -81,7 +81,11 @@ re-run `provision-customer.js` with an updated JSON.
 
 ### Smoke tests
 
-Token-gated via `SMOKE_TOKEN` env var. Useful when iterating:
+Two gating tiers. **Master kill switch:** set `SMOKE_DISABLED=true` on
+Render once real customers are onboarded — all `/api/_smoke/*` routes
+return 404.
+
+**Low-risk endpoints** (read-only or ingest-only) require just `SMOKE_TOKEN`:
 
 ```bash
 TOK="$SMOKE_TOKEN"
@@ -90,16 +94,34 @@ curl -X POST "$URL/api/_smoke/reddit-run" -H "x-smoke-token: $TOK"
 curl -X POST "$URL/api/_smoke/bluesky-run" -H "x-smoke-token: $TOK"
 curl -X POST "$URL/api/_smoke/rss-run" -H "x-smoke-token: $TOK"
 curl -X POST "$URL/api/_smoke/x-run" -H "x-smoke-token: $TOK"
-curl -X POST "$URL/api/_smoke/alert-run" -H "x-smoke-token: $TOK"
-curl -X POST "$URL/api/_smoke/digest-run" -H "x-smoke-token: $TOK" \
-  -H "content-type: application/json" -d '{"force":true}'
-curl -X POST "$URL/api/_smoke/inject-test-threat" -H "x-smoke-token: $TOK" \
-  -H "content-type: application/json" -d '{"tier":3}'
+curl -X POST "$URL/api/_smoke/telegram-run" -H "x-smoke-token: $TOK"
+curl -X POST "$URL/api/_smoke/truthsocial-run" -H "x-smoke-token: $TOK"
+curl -X POST "$URL/api/_smoke/cisa-run" -H "x-smoke-token: $TOK"
+curl    -G "$URL/api/_smoke/fbi-state-stats" --data-urlencode "state=NH" -H "x-smoke-token: $TOK"
+curl -X POST "$URL/api/_smoke/classify" -H "x-smoke-token: $TOK" \
+  -H "content-type: application/json" -d '{"text":"...","target":"..."}'
 ```
 
-The smoke endpoints are scheduled for removal in week 5 once a real
-admin auth layer takes their role. They live in `server.js` between the
-classify-smoke and dashboard mounts.
+**High-risk endpoints** (sends real email, creates synthetic data,
+cross-customer reads) require `SMOKE_TOKEN` + `X-Admin-Password`:
+
+```bash
+PW="$ADMIN_PASSWORD"
+curl -X POST "$URL/api/_smoke/digest-run" \
+  -H "x-smoke-token: $TOK" -H "x-admin-password: $PW" \
+  -H "content-type: application/json" -d '{"force":true}'
+curl -X POST "$URL/api/_smoke/alert-run"           -H "x-smoke-token: $TOK" -H "x-admin-password: $PW"
+curl -X POST "$URL/api/_smoke/inject-test-threat"  -H "x-smoke-token: $TOK" -H "x-admin-password: $PW" \
+  -H "content-type: application/json" -d '{"tier":3}'
+curl -X POST "$URL/api/_smoke/seed-dev"            -H "x-smoke-token: $TOK" -H "x-admin-password: $PW"
+curl -X POST "$URL/api/_smoke/cleanup-duplicates"  -H "x-smoke-token: $TOK" -H "x-admin-password: $PW"
+curl    -G "$URL/api/_smoke/mentions" --data-urlencode "limit=10" -H "x-smoke-token: $TOK" -H "x-admin-password: $PW"
+curl       "$URL/api/_smoke/threats"               -H "x-smoke-token: $TOK" -H "x-admin-password: $PW"
+```
+
+The smoke endpoints are slated for removal once a fuller admin API ships.
+Until then, the `/admin` page surfaces a banner showing the smoke state
+(enabled / disabled).
 
 ## Environment variables
 
@@ -133,6 +155,8 @@ Optional / per-source:
 - `WORKER_FAIL_THRESHOLD` (default 5), `WORKER_PAUSE_DURATION_MS` (default 30 min)
 - `X_QPS_GAP_MS` (default 5100ms — twitterapi.io free-tier rate limit)
 - `TELEGRAM_STALE_THRESHOLD` (default 5 — auto-pause channel after N empty/error fetches)
+- `SMOKE_DISABLED=true` — kill switch: all `/api/_smoke/*` routes return 404. Set once real customers are onboarded.
+- `TRUTHSOCIAL_ACCESS_TOKEN` — see `TRUTHSOCIAL_ONBOARDING.md`; worker dormant until set
 
 ## Tests
 
