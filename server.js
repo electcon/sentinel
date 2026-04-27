@@ -323,6 +323,9 @@ app.get('/api/_smoke/threats', requireSmokeToken, async (req, res) => {
 // Mounted at root so routes are at /login, /dashboard, /dashboard/...
 app.use(require('./routes/dashboard')(pool));
 
+// ── Internal admin (Basic auth via ADMIN_PASSWORD) ─────────────────
+app.use(require('./routes/admin')(pool));
+
 // Root redirects to dashboard (authed) or login (unauthed). The
 // dashboard middleware itself handles the redirect by checking the
 // session cookie.
