@@ -360,30 +360,55 @@ function build(pool) {
   });
 
   // ── /admin/provision (create or update customer via web form) ────
-  r.get('/admin/provision', gate, (req, res) => {
+  r.get('/admin/provision', gate, async (req, res) => {
     const flash = req.query.ok ? `<div style="background:#1a4a1a;color:#7fff7f;padding:10px;margin-bottom:14px;border-radius:4px">${escapeHtml(req.query.ok)}</div>` : '';
     const err = req.query.err ? `<div style="background:#5e0e16;color:#fff;padding:10px;margin-bottom:14px;border-radius:4px">${escapeHtml(req.query.err)}</div>` : '';
+    // Prefill from lead conversion (?lead_id=...&name=...&...). If lead_id
+    // is present we also surface the lead's message in the targets help.
+    const prefill = {
+      name: req.query.name || '',
+      contact_email: req.query.contact_email || '',
+      alert_email: req.query.alert_email || req.query.contact_email || '',
+      digest_email: req.query.digest_email || req.query.contact_email || '',
+      state: (req.query.state || '').toString().toUpperCase().slice(0, 2),
+      lead_id: req.query.lead_id || ''
+    };
+    let leadBanner = '';
+    if (prefill.lead_id) {
+      try {
+        const l = await pool.query('SELECT message, role, contact_name FROM beta_leads WHERE id = $1', [prefill.lead_id]);
+        if (l.rowCount) {
+          const r2 = l.rows[0];
+          leadBanner = `<div style="background:#1a3a5c;border:1px solid #2a5a8c;padding:12px 14px;border-radius:6px;margin-bottom:14px;font-size:13px">
+            <strong style="color:#cfe5ff">Converting lead</strong>${r2.contact_name ? ` from ${escapeHtml(r2.contact_name)}` : ''}${r2.role ? ` (${escapeHtml(r2.role)})` : ''}.
+            ${r2.message ? `<div style="margin-top:6px;color:#cdd5e0">"${escapeHtml(r2.message.slice(0, 400))}"</div>` : ''}
+          </div>`;
+        }
+      } catch (_) {}
+    }
     const body = `
       <a href="/admin" style="color:#8b949e;font-size:13px">← admin overview</a>
       <h1 style="margin-top:14px">Provision customer</h1>
       <p style="color:#8b949e;font-size:13px">Idempotent: if a customer with the same name exists, this updates it (preserves mentions/threats).</p>
       ${flash}${err}
+      ${leadBanner}
       <form method="POST" action="/admin/provision">
+        ${prefill.lead_id ? `<input type="hidden" name="lead_id" value="${escapeHtml(prefill.lead_id)}">` : ''}
         <div style="margin-bottom:14px">
           <label style="display:block;color:#8b949e;font-size:13px;margin-bottom:6px">Customer name (e.g., "Jolly for Governor")</label>
-          <input type="text" name="name" required style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:14px">
+          <input type="text" name="name" value="${escapeHtml(prefill.name)}" required style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:14px">
         </div>
         <div style="margin-bottom:14px">
           <label style="display:block;color:#8b949e;font-size:13px;margin-bottom:6px">Contact email (used for login)</label>
-          <input type="email" name="contact_email" required style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:14px">
+          <input type="email" name="contact_email" value="${escapeHtml(prefill.contact_email)}" required style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:14px">
         </div>
         <div style="margin-bottom:14px">
           <label style="display:block;color:#8b949e;font-size:13px;margin-bottom:6px">Alert email (tier 3+ real-time)</label>
-          <input type="email" name="alert_email" required style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:14px">
+          <input type="email" name="alert_email" value="${escapeHtml(prefill.alert_email)}" required style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:14px">
         </div>
         <div style="margin-bottom:14px">
           <label style="display:block;color:#8b949e;font-size:13px;margin-bottom:6px">Digest email (daily summary)</label>
-          <input type="email" name="digest_email" required style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:14px">
+          <input type="email" name="digest_email" value="${escapeHtml(prefill.digest_email)}" required style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:14px">
         </div>
         <div style="margin-bottom:14px">
           <label style="display:block;color:#8b949e;font-size:13px;margin-bottom:6px">Password (≥ 8 chars; tell customer to change on first login)</label>
@@ -399,7 +424,7 @@ function build(pool) {
         </div>
         <div style="margin-bottom:14px">
           <label style="display:block;color:#8b949e;font-size:13px;margin-bottom:6px">Candidate's state (2-letter postal abbrev, optional)</label>
-          <input type="text" name="state" maxlength="2" placeholder="NH" pattern="[A-Za-z]{2}" style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:14px;text-transform:uppercase">
+          <input type="text" name="state" maxlength="2" value="${escapeHtml(prefill.state)}" placeholder="NH" pattern="[A-Za-z]{2}" style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:14px;text-transform:uppercase">
           <div style="color:#8b949e;font-size:12px;margin-top:4px">Used for hate-crime risk lookup via FBI CDE.</div>
         </div>
         <div style="margin-bottom:14px">
@@ -504,12 +529,27 @@ function build(pool) {
         welcomeNote = ' (Welcome email skipped — customer existed; only re-send via CLI to avoid resend on every update.)';
       }
 
+      // If this provision came from a lead conversion, link it.
+      let leadNote = '';
+      if (req.body.lead_id) {
+        try {
+          await pool.query(`
+            UPDATE beta_leads
+            SET status = 'converted',
+                provisioned_customer_id = $2,
+                contacted_at = COALESCE(contacted_at, NOW())
+            WHERE id = $1
+          `, [req.body.lead_id, customerId]);
+          leadNote = ' Lead marked as converted.';
+        } catch (_) {}
+      }
+
       await audit(req, existing.rowCount > 0 ? 'update' : 'provision', {
         targetType: 'customer',
         targetId: customerId,
-        details: { name, contact_email, alert_email, digest_email, status: useStatus, state: useState, targets_added: created, targets_updated: updated, welcome_emailed: req.body.send_welcome === '1' && existing.rowCount === 0 }
+        details: { name, contact_email, alert_email, digest_email, status: useStatus, state: useState, targets_added: created, targets_updated: updated, welcome_emailed: req.body.send_welcome === '1' && existing.rowCount === 0, from_lead: req.body.lead_id || null }
       });
-      const note = `${existing.rowCount > 0 ? 'updated' : 'created'} customer; ${created} new + ${updated} updated targets.${welcomeNote}`;
+      const note = `${existing.rowCount > 0 ? 'updated' : 'created'} customer; ${created} new + ${updated} updated targets.${welcomeNote}${leadNote}`;
       res.redirect(`/admin/customers/${customerId}?ok=` + encodeURIComponent(note));
     } catch (e) {
       res.redirect('/admin/provision?err=' + encodeURIComponent(e.message.slice(0, 200)));
@@ -794,12 +834,25 @@ function build(pool) {
       const fg = { new: '#cfe5ff', contacted: '#d8902f', qualified: '#cfe5ff', converted: '#7fff7f', declined: '#ff7f7f', spam: '#d8902f' };
       return `<span class="status-pill" style="background:${colors[s] || '#1c2330'};color:${fg[s] || '#8b949e'}">${escapeHtml(s)}</span>`;
     };
-    const rows = q.rows.map(l => `
+    const rows = q.rows.map(l => {
+      // Build the prefilled-provision URL so "Convert" goes straight there.
+      const provisionParams = new URLSearchParams();
+      provisionParams.set('lead_id', l.id);
+      provisionParams.set('name', l.campaign_name);
+      provisionParams.set('contact_email', l.contact_email);
+      provisionParams.set('alert_email', l.contact_email);
+      provisionParams.set('digest_email', l.contact_email);
+      if (l.state) provisionParams.set('state', l.state);
+      const convertHref = `/admin/provision?${provisionParams.toString()}`;
+      const convertedLink = l.provisioned_customer_id
+        ? `<a href="/admin/customers/${l.provisioned_customer_id}" style="font-size:11px">→ customer</a>`
+        : `<a href="${escapeHtml(convertHref)}" style="background:#1a4a1a;color:#7fff7f;padding:3px 8px;border-radius:3px;font-size:11px;text-decoration:none;font-weight:600">+ Convert</a>`;
+      return `
       <tr>
         <td><strong>${escapeHtml(l.campaign_name)}</strong>${l.state ? ` <span class="muted">(${escapeHtml(l.state)})</span>` : ''}</td>
         <td>${escapeHtml(l.contact_name || '—')}<br><span class="muted" style="font-size:11px">${escapeHtml(l.role || '')}</span></td>
         <td><a href="mailto:${escapeHtml(l.contact_email)}">${escapeHtml(l.contact_email)}</a></td>
-        <td>${statusPill(l.status)}</td>
+        <td>${statusPill(l.status)}<br>${convertedLink}</td>
         <td class="muted">${ago(l.created_at)}</td>
         <td class="muted" style="max-width:280px">${escapeHtml((l.message || '').slice(0, 200))}</td>
         <td>
@@ -811,7 +864,8 @@ function build(pool) {
           `).join(' ')}
         </td>
       </tr>
-    `).join('');
+    `;
+    }).join('');
     const body = `
       <h1>Beta-access leads</h1>
       <div class="muted">Submissions from the public landing-page form.</div>

@@ -420,6 +420,95 @@ app.get('/api/_smoke/threats', requireSmokeAdmin, async (req, res) => {
   }
 });
 
+// ── One-click threat acknowledgment from email ──────────────────────
+// Tokenized link from alert emails. Marks threat_event status='reviewing'
+// without requiring login — designed for the 3am-incident case where
+// scrolling the dashboard is too much friction. Token is HMAC-signed
+// with 14d TTL.
+function renderAckPage(title, body, color = '#0a0f1a') {
+  return `<!doctype html>
+<html><head><meta charset="utf-8"><title>${title} — Sentinel</title>
+<style>body{margin:0;background:#0a0f1a;color:#e6edf3;font-family:Inter,system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px}
+.card{background:#0e1422;border:1px solid #1c2330;border-radius:8px;padding:32px;max-width:520px;text-align:center}
+.dot{width:48px;height:48px;border-radius:50%;background:${color};margin:0 auto 18px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:24px;font-weight:600}
+h1{margin:0 0 8px;font-size:22px}p{color:#cdd5e0;line-height:1.6;margin:8px 0}a{color:#4f9af0}
+button{background:#3a9c3a;color:#fff;border:0;padding:14px 28px;border-radius:6px;cursor:pointer;font-size:15px;font-weight:600}
+</style></head><body><div class="card">${body}</div></body></html>`;
+}
+function _escAck(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+async function _loadThreatForAck(token) {
+  const { verifyActionToken } = require('./lib/auth');
+  const sess = verifyActionToken(token, 'threat_ack');
+  if (!sess) return { ok: false, reason: 'invalid' };
+  const q = await pool.query(`
+    SELECT te.id, te.tier, te.status, m.body_excerpt, t.name AS target_name
+    FROM threat_events te
+    JOIN mentions m ON m.id = te.mention_id
+    LEFT JOIN targets t ON t.id = te.target_id
+    WHERE te.id = $1 LIMIT 1
+  `, [sess.id]);
+  if (!q.rowCount) return { ok: false, reason: 'notfound' };
+  return { ok: true, event: q.rows[0] };
+}
+
+// GET shows a confirmation page with a POST button. Critical: do NOT
+// mutate state on GET — Gmail / Outlook / virus scanners pre-fetch all
+// links in incoming email, which would auto-acknowledge threats.
+app.get('/threat-ack/:token', async (req, res) => {
+  try {
+    const r = await _loadThreatForAck(req.params.token);
+    if (!r.ok) {
+      const msg = r.reason === 'notfound' ? 'Threat event not found.' : 'Link expired or invalid.';
+      return res.status(r.reason === 'notfound' ? 404 : 401).send(renderAckPage('Invalid', `<div class="dot" style="background:#7a1019">!</div><h1>${_escAck(msg)}</h1><p><a href="/dashboard">Open dashboard</a></p>`));
+    }
+    const ev = r.event;
+    if (ev.status !== 'open') {
+      return res.send(renderAckPage('Already handled', `<div class="dot" style="background:#3a9c3a">OK</div><h1>Already in progress</h1><p>This threat is currently in status <strong>${_escAck(ev.status)}</strong>. No further action needed.</p><p><a href="/dashboard/threats/${_escAck(ev.id)}">Open in dashboard</a></p>`, '#3a9c3a'));
+    }
+    res.send(renderAckPage('Confirm', `<h1>Acknowledge this threat?</h1>
+      <p>Tier ${_escAck(ev.tier)} threat against <strong>${_escAck(ev.target_name || 'unknown')}</strong>.</p>
+      <p style="font-size:13px;color:#8b949e;background:#0a0f1a;padding:10px 14px;border-radius:4px;margin:18px 0;border:1px solid #1c2330;text-align:left">${_escAck((ev.body_excerpt || '').slice(0, 240))}</p>
+      <form method="POST" action="/threat-ack/${_escAck(req.params.token)}">
+        <button type="submit">Acknowledge — mark as reviewing</button>
+      </form>
+      <p style="font-size:12px;color:#8b949e;margin-top:18px">This marks the threat as <em>reviewing</em> without requiring login. You can still log in afterward to add notes or change disposition.</p>`, '#1a3a5c'));
+  } catch (e) {
+    console.error('[threat-ack GET]', e.message);
+    res.status(500).send(renderAckPage('Error', `<div class="dot" style="background:#7a1019">!</div><h1>Error</h1><p>${_escAck(e.message)}</p>`));
+  }
+});
+
+// POST actually marks the threat as reviewing. Idempotent — re-POSTing
+// is a no-op once status changes from 'open'.
+app.post('/threat-ack/:token', express.urlencoded({ extended: false }), async (req, res) => {
+  try {
+    const r = await _loadThreatForAck(req.params.token);
+    if (!r.ok) {
+      return res.status(401).send(renderAckPage('Invalid', `<div class="dot" style="background:#7a1019">!</div><h1>Link expired or invalid</h1><p><a href="/dashboard">Open dashboard</a></p>`));
+    }
+    const ev = r.event;
+    if (ev.status !== 'open') {
+      return res.send(renderAckPage('Already handled', `<div class="dot" style="background:#3a9c3a">OK</div><h1>Already in progress</h1><p>Status: <strong>${_escAck(ev.status)}</strong>.</p><p><a href="/dashboard/threats/${_escAck(ev.id)}">Open in dashboard</a></p>`, '#3a9c3a'));
+    }
+    const stamp = new Date().toISOString().slice(0, 19).replace('T', ' ') + ' UTC';
+    const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+    await pool.query(`
+      UPDATE threat_events
+      SET status = 'reviewing',
+          notes = CASE WHEN notes IS NULL OR notes = '' THEN $2 ELSE notes || E'\\n' || $2 END
+      WHERE id = $1 AND status = 'open'
+    `, [ev.id, `[${stamp}] [email-ack from ${ip || 'unknown ip'}] → reviewing (one-click link)`]);
+    res.send(renderAckPage('Acknowledged', `<div class="dot" style="background:#3a9c3a">OK</div>
+      <h1>Acknowledged</h1>
+      <p>Tier ${_escAck(ev.tier)} threat against <strong>${_escAck(ev.target_name || 'unknown')}</strong> is now marked <strong>reviewing</strong>.</p>
+      <p style="margin-top:18px"><a href="/dashboard/threats/${_escAck(ev.id)}">Open in dashboard</a> to add notes or change disposition.</p>`, '#3a9c3a'));
+  } catch (e) {
+    console.error('[threat-ack POST]', e.message);
+    res.status(500).send(renderAckPage('Error', `<div class="dot" style="background:#7a1019">!</div><h1>Error</h1><p>${_escAck(e.message)}</p>`));
+  }
+});
+
 // ── Public status page ─────────────────────────────────────────────
 // Read-only — no auth, no PII. Two endpoints: /status (HTML) and
 // /status.json (machine-readable). Suitable for uptime monitors.
