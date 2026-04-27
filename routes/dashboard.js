@@ -281,6 +281,8 @@ function build(pool) {
       const ok = await verifyPassword(password, q.rows[0].password_hash);
       if (!ok) return res.redirect(`/login?err=1&next=${encodeURIComponent(next)}`);
       setSessionCookie(res, q.rows[0].id);
+      // Record last login for ops visibility — best-effort, don't block.
+      pool.query(`UPDATE customers SET last_login_at = NOW(), login_count = login_count + 1 WHERE id = $1`, [q.rows[0].id]).catch(() => {});
       res.redirect(next.startsWith('/') ? next : '/dashboard');
     } catch (e) {
       res.status(500).send('login error: ' + escapeHtml(e.message));

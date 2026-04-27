@@ -27,6 +27,8 @@ async function initSchema(pool) {
     )
   `);
   await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS state CHAR(2)`);
+  await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS login_count INTEGER NOT NULL DEFAULT 0`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS targets (

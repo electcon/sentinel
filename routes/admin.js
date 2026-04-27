@@ -223,7 +223,12 @@ function build(pool) {
       LEFT JOIN (SELECT customer_id, COUNT(*) AS n FROM mentions GROUP BY customer_id) m ON m.customer_id = c.id
       ORDER BY c.created_at DESC
     `);
-    const rows = r2.rows.map(c => `
+    const rows = r2.rows.map(c => {
+      const inactive = !c.last_login_at || (Date.now() - new Date(c.last_login_at).getTime() > 30 * 86400 * 1000);
+      const loginCell = c.last_login_at
+        ? `${ago(c.last_login_at)}${inactive ? ' <span class="pill" style="background:#3d301a;color:#d8902f">inactive</span>' : ''}<div class="muted" style="font-size:11px">${c.login_count || 0} logins</div>`
+        : '<span class="pill" style="background:#5e0e16;color:#ff7f7f">never</span>';
+      return `
       <tr>
         <td><strong>${escapeHtml(c.name)}</strong><div class="muted">${escapeHtml(c.id)}</div></td>
         <td><span class="pill ok">${escapeHtml(c.status)}</span></td>
@@ -231,18 +236,19 @@ function build(pool) {
         <td>${c.mention_count}</td>
         <td class="muted">${escapeHtml(c.contact_email)}</td>
         <td class="muted">${escapeHtml(c.alert_email)}</td>
-        <td class="muted">${escapeHtml(c.digest_email)}</td>
+        <td>${loginCell}</td>
         <td class="muted">${fmtTime(c.created_at)}</td>
         <td>${c.password_hash ? '<span class="pill ok">set</span>' : '<span class="pill err">no pw</span>'}</td>
         <td><a href="/admin/customers/${c.id}">open</a></td>
       </tr>
-    `).join('');
+    `;
+    }).join('');
     const body = `
       <h1>Customers</h1>
       ${flash}
       <div style="margin:14px 0"><a href="/admin/provision"><button style="background:#4f9af0;color:#fff;border:0;padding:8px 14px;border-radius:4px;cursor:pointer;font-size:13px">+ Provision new customer</button></a></div>
       <table>
-        <thead><tr><th>Name / ID</th><th>Status</th><th>Targets</th><th>Mentions</th><th>Contact</th><th>Alert</th><th>Digest</th><th>Created</th><th>PW</th><th></th></tr></thead>
+        <thead><tr><th>Name / ID</th><th>Status</th><th>Targets</th><th>Mentions</th><th>Contact</th><th>Alert</th><th>Last login</th><th>Created</th><th>PW</th><th></th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     `;
@@ -307,6 +313,7 @@ function build(pool) {
         <div class="muted">alert: ${escapeHtml(cust.alert_email)}</div>
         <div class="muted">digest: ${escapeHtml(cust.digest_email)}</div>
         <div class="muted">state: ${cust.state ? escapeHtml(cust.state) : '<em>not set</em>'} · status: ${escapeHtml(cust.status)} · created: ${fmtTime(cust.created_at)} · last digest: ${fmtTime(cust.last_digest_at)}</div>
+        <div class="muted">last login: ${cust.last_login_at ? `${ago(cust.last_login_at)} (${fmtTime(cust.last_login_at)})` : '<em>never</em>'} · ${cust.login_count || 0} logins total</div>
       </div>
       ${riskPanel}
       <h2>Targets (${targets.rowCount})</h2>
