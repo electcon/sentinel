@@ -252,6 +252,55 @@ Internal codename. Public-facing UI ships <strong>2026-06-15</strong>.</p>
 just nothing here yet.</p></body></html>`);
 });
 
+// ── In-process scheduler ────────────────────────────────────────────
+// At v1 scale we run the ingest + alert workers directly inside the
+// web process via setInterval. Single dyno, no separate Render Cron
+// services needed. Each worker's processOne is idempotent (dupe-skip
+// via UNIQUE(source, source_id)) so overlapping runs are safe.
+//
+// Disabled by default in non-production unless SCHEDULER_ENABLED=true.
+// Production (NODE_ENV=production on Render) auto-enables.
+const SCHEDULES = [
+  { name: 'alert',   intervalMs:  60 * 1000, startupDelayMs:  5 * 1000, run: () => require('./workers/alert').runOnce({ pool, log: scheduledLog('alert') }) },
+  { name: 'bluesky', intervalMs:  5 * 60 * 1000, startupDelayMs: 30 * 1000, run: () => require('./workers/bluesky').runOnce({ pool, log: scheduledLog('bluesky') }) },
+  { name: 'reddit',  intervalMs: 10 * 60 * 1000, startupDelayMs: 60 * 1000, run: () => require('./workers/reddit').runOnce({ pool, log: scheduledLog('reddit') }) },
+  { name: 'rss',     intervalMs: 15 * 60 * 1000, startupDelayMs: 90 * 1000, run: () => require('./workers/rss').runOnce({ pool, log: scheduledLog('rss') }) }
+];
+
+function scheduledLog(name) {
+  return (m) => console.log(`[sched ${name}] ${m}`);
+}
+
+function startScheduler() {
+  for (const s of SCHEDULES) {
+    setTimeout(() => {
+      runWithGuard(s);
+      setInterval(() => runWithGuard(s), s.intervalMs);
+    }, s.startupDelayMs);
+    console.log(`[sched] ${s.name} scheduled every ${s.intervalMs / 1000}s (first run in ${s.startupDelayMs / 1000}s)`);
+  }
+}
+
+let _running = new Set();
+async function runWithGuard(s) {
+  // Don't allow the same worker to overlap with itself — second tick
+  // skips silently. Different workers can run in parallel.
+  if (_running.has(s.name)) {
+    console.log(`[sched ${s.name}] previous run still in flight — skipping this tick`);
+    return;
+  }
+  _running.add(s.name);
+  const t0 = Date.now();
+  try {
+    const out = await s.run();
+    console.log(`[sched ${s.name}] ${Date.now() - t0}ms`, JSON.stringify(out));
+  } catch (e) {
+    console.error(`[sched ${s.name}] FAILED after ${Date.now() - t0}ms: ${e.message}`);
+  } finally {
+    _running.delete(s.name);
+  }
+}
+
 // ── Boot ────────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT, 10) || 10000;
 
@@ -262,6 +311,14 @@ const PORT = parseInt(process.env.PORT, 10) || 10000;
   } catch (e) {
     console.error('[sentinel] schema init FAILED:', e.message);
     process.exit(2);
+  }
+
+  const enableScheduler = process.env.SCHEDULER_ENABLED === 'true' ||
+                          process.env.NODE_ENV === 'production';
+  if (enableScheduler) {
+    startScheduler();
+  } else {
+    console.log('[sched] disabled (set SCHEDULER_ENABLED=true to enable)');
   }
 
   app.listen(PORT, () => {
