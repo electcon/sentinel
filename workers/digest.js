@@ -46,7 +46,7 @@ async function runOnce({ pool, log = console.log, force = false }) {
   let sent = 0; let dryRun = 0; let failed = 0; let skipped = 0;
   for (const c of due.rows) {
     const data = await rollupForCustomer(pool, c.id);
-    if (data.totalMentions === 0 && data.openThreats === 0 && !force) {
+    if (data.totalMentions === 0 && data.openThreats === 0 && data.reviewQueue.pending === 0 && !force) {
       log(`[digest] skip ${c.name} — nothing in window`);
       skipped++;
       // Still set last_digest_at so we don't re-check every 30 min
@@ -99,13 +99,30 @@ async function rollupForCustomer(pool, customerId) {
     WHERE customer_id = $1 AND status NOT IN ('dismissed', 'reported_law_enf', 'monitoring')
   `, [customerId]);
 
+  // Tier-2 review queue: count pending + 3 oldest as samples for the digest.
+  const reviewQueueCount = await pool.query(`
+    SELECT COUNT(*)::int AS n FROM mentions WHERE customer_id = $1 AND review_status = 'pending'
+  `, [customerId]);
+  const reviewQueueSamples = await pool.query(`
+    SELECT m.id, m.source, m.source_url, m.body_excerpt, m.posted_at, t.name AS target
+    FROM mentions m
+    LEFT JOIN targets t ON t.id = m.target_id
+    WHERE m.customer_id = $1 AND m.review_status = 'pending'
+    ORDER BY m.ingested_at ASC
+    LIMIT 3
+  `, [customerId]);
+
   return {
     windowHours: WINDOW_HOURS,
     totalMentions,
     byTier,
     bySource,
     openThreats: openThreats.rows[0].n,
-    topMentions: top.rows.map(r => ({ tier: r.tier || 1, source: r.source, source_url: r.source_url, body_excerpt: r.body_excerpt, posted_at: r.posted_at, target: r.target || 'unknown' }))
+    topMentions: top.rows.map(r => ({ tier: r.tier || 1, source: r.source, source_url: r.source_url, body_excerpt: r.body_excerpt, posted_at: r.posted_at, target: r.target || 'unknown' })),
+    reviewQueue: {
+      pending: reviewQueueCount.rows[0].n,
+      oldest: reviewQueueSamples.rows.map(r => ({ id: r.id, source: r.source, source_url: r.source_url, body_excerpt: r.body_excerpt, posted_at: r.posted_at, target: r.target || 'unknown' }))
+    }
   };
 }
 
