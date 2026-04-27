@@ -454,11 +454,34 @@ function startScheduler() {
 }
 
 let _running = new Set();
+// Per-source error budget. Five consecutive failures pause a worker
+// for 30 min — protects against runaway error logs and rate-limit
+// burns when an upstream is down. Auto-resume after cooldown.
+const _failureCount = new Map();   // workerName → consecutive failures
+const _pausedUntil = new Map();    // workerName → epoch ms
+const FAIL_THRESHOLD = parseInt(process.env.WORKER_FAIL_THRESHOLD, 10) || 5;
+const PAUSE_DURATION_MS = parseInt(process.env.WORKER_PAUSE_DURATION_MS, 10) || 30 * 60 * 1000;
+
+function getPauseInfo() {
+  const out = [];
+  const now = Date.now();
+  for (const [name, until] of _pausedUntil.entries()) {
+    if (until > now) out.push({ worker: name, paused_until: new Date(until).toISOString(), remaining_seconds: Math.floor((until - now) / 1000) });
+  }
+  return out;
+}
+
 async function runWithGuard(s) {
   // Don't allow the same worker to overlap with itself — second tick
   // skips silently. Different workers can run in parallel.
   if (_running.has(s.name)) {
     console.log(`[sched ${s.name}] previous run still in flight — skipping this tick`);
+    return;
+  }
+  // Auto-pause guard.
+  const pausedUntil = _pausedUntil.get(s.name) || 0;
+  if (pausedUntil > Date.now()) {
+    console.log(`[sched ${s.name}] paused until ${new Date(pausedUntil).toISOString()} — skipping`);
     return;
   }
   _running.add(s.name);
@@ -468,10 +491,18 @@ async function runWithGuard(s) {
   try {
     out = await s.run();
     ok = true;
+    _failureCount.set(s.name, 0);
+    if (_pausedUntil.has(s.name)) _pausedUntil.delete(s.name);
     console.log(`[sched ${s.name}] ${Date.now() - t0}ms`, JSON.stringify(out));
   } catch (e) {
     err = e.message;
-    console.error(`[sched ${s.name}] FAILED after ${Date.now() - t0}ms: ${e.message}`);
+    const failures = (_failureCount.get(s.name) || 0) + 1;
+    _failureCount.set(s.name, failures);
+    if (failures >= FAIL_THRESHOLD) {
+      _pausedUntil.set(s.name, Date.now() + PAUSE_DURATION_MS);
+      console.error(`[sched ${s.name}] PAUSED for ${PAUSE_DURATION_MS / 1000}s after ${failures} consecutive failures`);
+    }
+    console.error(`[sched ${s.name}] FAILED (${failures}/${FAIL_THRESHOLD}) after ${Date.now() - t0}ms: ${e.message}`);
   } finally {
     _running.delete(s.name);
     // Best-effort run log; don't propagate DB errors as scheduler errors.
@@ -481,6 +512,11 @@ async function runWithGuard(s) {
     `, [s.name, startedAt, Date.now() - t0, ok, out ? JSON.stringify(out) : null, err]).catch(() => {});
   }
 }
+
+// Pause state is inferable from worker_runs (count of consecutive
+// ok=false rows from most-recent backwards) — /admin and /status
+// query that directly so they stay decoupled from in-process state.
+// getPauseInfo above is for internal logging only.
 
 // ── Boot ────────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT, 10) || 10000;
