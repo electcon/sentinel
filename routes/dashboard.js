@@ -400,10 +400,7 @@ function build(pool) {
     const t = q.rows[0];
 
     const statusButtons = STATUS_OPTIONS.filter(s => s.value !== t.status).map(s => `
-      <form method="POST" action="/dashboard/threats/${t.id}/action">
-        <input type="hidden" name="status" value="${s.value}">
-        <button type="submit" class="${s.value === 'dismissed' ? 'danger' : 'secondary'}">→ ${escapeHtml(s.label)}</button>
-      </form>
+      <button type="submit" name="status" value="${s.value}" class="${s.value === 'dismissed' ? 'danger' : 'secondary'}">→ ${escapeHtml(s.label)}</button>
     `).join(' ');
 
     const body = `
@@ -419,6 +416,7 @@ function build(pool) {
           <div>posted</div><div>${fmtTime(t.posted_at)}</div>
           <div>detected</div><div>${fmtTime(t.created_at)}</div>
           <div>alerted</div><div>${fmtTime(t.alerted_at)}</div>
+          <div>resolved</div><div>${fmtTime(t.resolved_at)}</div>
           <div>url</div><div><a href="${escapeHtml(t.source_url)}" target="_blank" rel="noopener">${escapeHtml(t.source_url || '—')}</a></div>
           <div>evidence</div><div><code>${escapeHtml(t.s3_key || '—')}</code></div>
         </div>
@@ -430,9 +428,17 @@ function build(pool) {
       <h2>Classifier rationale</h2>
       <div class="body-excerpt">${escapeHtml(t.rationale || '—')}</div>
 
-      <h2>Status</h2>
-      <div class="actions">${statusButtons}</div>
-      ${t.notes ? `<h2>Notes</h2><div class="body-excerpt">${escapeHtml(t.notes)}</div>` : ''}
+      <h2>Update status</h2>
+      <form method="POST" action="/dashboard/threats/${t.id}/action">
+        <div class="field">
+          <label for="note">Note (optional — adds to the audit trail)</label>
+          <textarea id="note" name="note" rows="2" style="width:100%;background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;font-family:inherit;font-size:14px" placeholder="Why this disposition?"></textarea>
+        </div>
+        <div class="actions">${statusButtons}</div>
+      </form>
+
+      ${t.notes ? `<h2>Notes / audit trail</h2>
+        <div class="body-excerpt" style="font-size:13px">${escapeHtml(t.notes)}</div>` : ''}
     `;
     res.set('Content-Type', 'text/html; charset=utf-8');
     res.send(layout({ title: 'Threat', customer: req.customer, body, active: 'threats' }));
@@ -440,41 +446,73 @@ function build(pool) {
 
   r.post('/dashboard/threats/:id/action', auth, express.urlencoded({ extended: false }), async (req, res) => {
     const newStatus = req.body.status;
+    const note = (req.body.note || '').trim().slice(0, 1000);
     const valid = STATUS_OPTIONS.map(s => s.value);
     if (!valid.includes(newStatus)) return res.status(400).send('bad status');
     const isResolved = ['dismissed', 'reported_law_enf', 'monitoring'].includes(newStatus);
+    const stamp = new Date().toISOString().slice(0, 19).replace('T', ' ') + ' UTC';
+    const actor = req.customer.name || req.customer.id;
+    const entry = `[${stamp}] [${actor}] → ${newStatus}${note ? ' — ' + note : ''}`;
     await pool.query(`
       UPDATE threat_events
       SET status = $2,
-          resolved_at = CASE WHEN $3::boolean THEN NOW() ELSE resolved_at END
-      WHERE id = $1 AND customer_id = $4
-    `, [req.params.id, newStatus, isResolved, req.customer.id]);
+          resolved_at = CASE WHEN $3::boolean THEN NOW() ELSE resolved_at END,
+          notes = CASE WHEN notes IS NULL OR notes = '' THEN $4 ELSE notes || E'\\n' || $4 END
+      WHERE id = $1 AND customer_id = $5
+    `, [req.params.id, newStatus, isResolved, entry, req.customer.id]);
     res.redirect(`/dashboard/threats/${req.params.id}`);
   });
 
-  // ── Mentions list (paginated) ──────────────────────────────────────
+  // ── Mentions list (paginated, searchable) ──────────────────────────
   r.get('/dashboard/mentions', auth, async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
     const tierFilter = req.query.tier;
+    const sourceFilter = req.query.source;
+    const search = (req.query.q || '').trim().slice(0, 200);
     const args = [req.customer.id];
-    let where = '';
+    const wheres = [];
     if (tierFilter && /^[1-4]$/.test(tierFilter)) {
-      where = 'AND m.threat_tier = $2';
       args.push(parseInt(tierFilter, 10));
+      wheres.push(`m.threat_tier = $${args.length}`);
     }
+    if (sourceFilter && /^[a-z_]+$/i.test(sourceFilter)) {
+      args.push(sourceFilter);
+      wheres.push(`m.source = $${args.length}`);
+    }
+    if (search) {
+      args.push('%' + search + '%');
+      wheres.push(`m.body_excerpt ILIKE $${args.length}`);
+    }
+    const whereClause = wheres.length ? 'AND ' + wheres.join(' AND ') : '';
     args.push(limit);
     const q = await pool.query(`
       SELECT m.id, m.threat_tier, m.source, m.source_url, m.posted_at, m.body_excerpt, m.rationale,
              t.name AS target_name
       FROM mentions m
       LEFT JOIN targets t ON t.id = m.target_id
-      WHERE m.customer_id = $1 ${where}
+      WHERE m.customer_id = $1 ${whereClause}
       ORDER BY m.ingested_at DESC
       LIMIT $${args.length}
     `, args);
 
-    const filterPill = (val, label) =>
-      `<a href="/dashboard/mentions${val === 'all' ? '' : '?tier=' + val}" class="pill" style="background:${(tierFilter || 'all') === val ? '#4f9af0' : '#1c2330'};color:${(tierFilter || 'all') === val ? '#fff' : '#8b949e'};margin-right:6px;">${escapeHtml(label)}</a>`;
+    const baseQs = (overrides) => {
+      const params = new URLSearchParams();
+      const tier = overrides.tier !== undefined ? overrides.tier : tierFilter;
+      const source = overrides.source !== undefined ? overrides.source : sourceFilter;
+      const q = overrides.q !== undefined ? overrides.q : search;
+      if (tier && tier !== 'all') params.set('tier', tier);
+      if (source && source !== 'all') params.set('source', source);
+      if (q) params.set('q', q);
+      return params.toString() ? '?' + params.toString() : '';
+    };
+
+    const filterPill = (kind, val, label) => {
+      const active = kind === 'tier' ? (tierFilter || 'all') === val
+                    : kind === 'source' ? (sourceFilter || 'all') === val : false;
+      const overrides = {};
+      overrides[kind] = val === 'all' ? '' : val;
+      return `<a href="/dashboard/mentions${baseQs(overrides)}" class="pill" style="background:${active ? '#4f9af0' : '#1c2330'};color:${active ? '#fff' : '#8b949e'};margin-right:6px;">${escapeHtml(label)}</a>`;
+    };
 
     const rows = q.rows.map(m => `
       <tr>
@@ -489,14 +527,28 @@ function build(pool) {
 
     const body = `
       <h1>Mentions</h1>
-      <div style="margin:16px 0">
-        ${filterPill('all', 'all tiers')}
-        ${[4, 3, 2, 1].map(t => filterPill(String(t), `T${t}`)).join('')}
+      <form method="GET" action="/dashboard/mentions" style="margin:14px 0">
+        <input type="text" name="q" value="${escapeHtml(search)}" placeholder="Search mention text…" style="max-width:320px;display:inline-block;width:auto;margin-right:8px">
+        ${tierFilter ? `<input type="hidden" name="tier" value="${escapeHtml(tierFilter)}">` : ''}
+        ${sourceFilter ? `<input type="hidden" name="source" value="${escapeHtml(sourceFilter)}">` : ''}
+        <button type="submit" class="secondary">Search</button>
+        ${(search || tierFilter || sourceFilter) ? `<a href="/dashboard/mentions" class="muted" style="margin-left:10px">clear</a>` : ''}
+      </form>
+      <div style="margin:8px 0">
+        <span class="muted" style="font-size:12px;margin-right:8px">tier:</span>
+        ${filterPill('tier', 'all', 'all')}
+        ${[4, 3, 2, 1].map(t => filterPill('tier', String(t), `T${t}`)).join('')}
       </div>
-      ${q.rowCount ? `<table>
+      <div style="margin:8px 0">
+        <span class="muted" style="font-size:12px;margin-right:8px">source:</span>
+        ${filterPill('source', 'all', 'all')}
+        ${['reddit','bluesky','rss','x','synth'].map(s => filterPill('source', s, s)).join('')}
+      </div>
+      <div class="muted" style="margin-top:14px;font-size:12px">${q.rowCount} result${q.rowCount === 1 ? '' : 's'}${search ? ' matching "' + escapeHtml(search) + '"' : ''}</div>
+      ${q.rowCount ? `<table style="margin-top:8px">
         <thead><tr><th>Tier</th><th>Target</th><th>Source</th><th>Excerpt</th><th>Posted</th><th></th></tr></thead>
         <tbody>${rows}</tbody>
-      </table>` : '<div class="empty">No mentions yet.</div>'}
+      </table>` : '<div class="empty">No mentions match these filters.</div>'}
     `;
     res.set('Content-Type', 'text/html; charset=utf-8');
     res.send(layout({ title: 'Mentions', customer: req.customer, body, active: 'mentions' }));
