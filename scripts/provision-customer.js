@@ -130,7 +130,7 @@ async function main() {
 async function sendWelcomeEmail({ spec, loginUrl }) {
   const { Resend } = require('resend');
   const resend = new Resend(process.env.RESEND_API_KEY);
-  const from = process.env.WELCOME_FROM_EMAIL || 'Sentinel <hello@parallaxadvisory.llc>';
+  const from = process.env.WELCOME_FROM_EMAIL || 'Sentinel <hello@sentinel.parallaxadvisory.llc>';
   const text = [
     `Hi — welcome to Sentinel.`,
     ``,
