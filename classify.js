@@ -89,6 +89,16 @@ async function classifyEscalated(opts) {
 }
 
 async function _call(model, userPrompt, opts) {
+  // CLASSIFIER_PROVIDER selects the upstream:
+  //   'anthropic'  (default) — direct Anthropic SDK
+  //   'openrouter'           — OpenAI-compatible HTTP via openrouter.ai
+  // Per-call override: opts.provider takes precedence over env var.
+  const provider = (opts && opts.provider) || process.env.CLASSIFIER_PROVIDER || 'anthropic';
+  if (provider === 'openrouter') return _callOpenRouter(model, userPrompt, opts);
+  return _callAnthropic(model, userPrompt, opts);
+}
+
+async function _callAnthropic(model, userPrompt, opts) {
   const t0 = Date.now();
   const res = await client().messages.create({
     model,
@@ -97,40 +107,66 @@ async function _call(model, userPrompt, opts) {
     messages: [{ role: 'user', content: userPrompt }]
   });
   const text = (res.content || []).map(b => b.type === 'text' ? b.text : '').join('').trim();
-  // Extract the first balanced JSON object. Robust to: code fences
-  // (```json ... ```), leading/trailing prose, and trailing markdown
-  // sections (e.g. "**Reasoning:**...") that some models append.
-  let parsed;
+  return _parseClassifierOutput(text, model, t0);
+}
+
+// OpenRouter classifier path. Uses any model exposed via openrouter.ai
+// — useful for A/B testing other providers (Llama, Mistral, GPT-5, etc.)
+// against the same THREAT_TAXONOMY rubric. Default model is set by env
+// OPENROUTER_MODEL; if absent, falls through to whatever was passed in
+// for `model` (which from the Anthropic-default path is e.g. 'claude-haiku-4-5-…',
+// not a valid OpenRouter id) so DO set OPENROUTER_MODEL when using this provider.
+async function _callOpenRouter(model, userPrompt, opts) {
+  if (!process.env.OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY not set');
+  const useModel = process.env.OPENROUTER_MODEL || (opts && opts.openrouterModel) || model;
+  const t0 = Date.now();
+  const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+      'Content-Type': 'application/json',
+      'HTTP-Referer': process.env.DASHBOARD_BASE_URL || 'https://sentinel-staging-i3ug.onrender.com',
+      'X-Title': 'Sentinel'
+    },
+    body: JSON.stringify({
+      model: useModel,
+      messages: [
+        { role: 'system', content: SYSTEM },
+        { role: 'user', content: userPrompt }
+      ],
+      max_tokens: 256,
+      temperature: 0
+    })
+  });
+  if (!r.ok) {
+    const bodyText = await r.text().catch(() => '');
+    throw new Error(`openrouter ${r.status}: ${bodyText.slice(0, 300)}`);
+  }
+  const j = await r.json();
+  const text = (j?.choices?.[0]?.message?.content || '').trim();
+  return _parseClassifierOutput(text, useModel, t0);
+}
+
+function _parseClassifierOutput(text, modelLabel, t0) {
   const jsonStr = extractFirstJsonObject(text);
-  try {
-    parsed = JSON.parse(jsonStr);
-  } catch (e) {
-    // If the model returned non-JSON, escalate to a tier-2 human review
-    // rather than guess. Caller logs and queues for manual classification.
+  let parsed;
+  try { parsed = JSON.parse(jsonStr); }
+  catch (_) {
     return {
-      tier: 2,
-      confidence: 0,
-      sentiment: 0,
+      tier: 2, confidence: 0, sentiment: 0,
       rationale: 'classifier returned unparseable output — see raw',
-      raw: text,
-      model,
-      prompt_v: PROMPT_V,
-      ms: Date.now() - t0,
-      parse_error: true
+      raw: text, model: modelLabel, prompt_v: PROMPT_V,
+      ms: Date.now() - t0, parse_error: true
     };
   }
-  // Conservative-bias: if confidence < 0.7, bump up one tier (capped at 4).
   let tier = Math.max(1, Math.min(4, parseInt(parsed.tier, 10) || 1));
   const confidence = typeof parsed.confidence === 'number' ? parsed.confidence : 0.5;
   if (confidence < 0.7 && tier < 4) tier = tier + 1;
   return {
-    tier,
-    confidence,
+    tier, confidence,
     sentiment: typeof parsed.sentiment === 'number' ? parsed.sentiment : 0,
     rationale: String(parsed.rationale || '').slice(0, 200),
-    raw: parsed,
-    model,
-    prompt_v: PROMPT_V,
+    raw: parsed, model: modelLabel, prompt_v: PROMPT_V,
     ms: Date.now() - t0
   };
 }

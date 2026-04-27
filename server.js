@@ -61,6 +61,7 @@ function requireSmokeToken(req, res, next) {
 }
 
 // Classify a synthetic mention end-to-end.
+// Body: { text, target?, source?, provider?: 'anthropic'|'openrouter', openrouterModel? }
 app.post('/api/_smoke/classify', requireSmokeToken, async (req, res) => {
   try {
     const { classify } = require('./classify');
@@ -71,7 +72,9 @@ app.post('/api/_smoke/classify', requireSmokeToken, async (req, res) => {
       body,
       source: req.body.source || 'smoke',
       authorHandle: 'smoke-test',
-      postedAt: new Date().toISOString()
+      postedAt: new Date().toISOString(),
+      provider: req.body.provider,
+      openrouterModel: req.body.openrouterModel
     });
     res.json(out);
   } catch (e) {
