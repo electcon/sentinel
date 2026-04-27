@@ -340,6 +340,70 @@ app.get('/api/_smoke/threats', requireSmokeToken, async (req, res) => {
   }
 });
 
+// ── Public status page ─────────────────────────────────────────────
+// Read-only — no auth, no PII. Two endpoints: /status (HTML) and
+// /status.json (machine-readable). Suitable for uptime monitors.
+async function buildStatus() {
+  const t0 = Date.now();
+  let dbOk = false; let dbMs = null;
+  try {
+    await pool.query('SELECT 1');
+    dbMs = Date.now() - t0; dbOk = true;
+  } catch (_) {}
+
+  let workers = [];
+  if (dbOk) {
+    try {
+      const r = await pool.query(`
+        SELECT DISTINCT ON (worker_name) worker_name, started_at, duration_ms, ok
+        FROM worker_runs ORDER BY worker_name, started_at DESC
+      `);
+      workers = r.rows.map(w => ({
+        name: w.worker_name,
+        last_run_at: w.started_at,
+        last_run_ms: w.duration_ms,
+        last_run_ok: w.ok,
+        seconds_since: Math.floor((Date.now() - new Date(w.started_at).getTime()) / 1000)
+      }));
+    } catch (_) {}
+  }
+
+  return {
+    service: 'sentinel',
+    version: require('./package.json').version,
+    timestamp: new Date().toISOString(),
+    db: { ok: dbOk, ms: dbMs },
+    workers
+  };
+}
+app.get('/status.json', async (req, res) => {
+  const s = await buildStatus();
+  res.json(s);
+});
+app.get('/status', async (req, res) => {
+  const s = await buildStatus();
+  const ago = (sec) => sec == null ? 'never' : (sec < 60 ? sec + 's ago' : sec < 3600 ? Math.floor(sec/60) + 'm ago' : sec < 86400 ? Math.floor(sec/3600) + 'h ago' : Math.floor(sec/86400) + 'd ago');
+  const escapeHtml = (str) => String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  const dot = (ok) => `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${ok?'#3a9c3a':'#a82a2a'};margin-right:8px;vertical-align:middle"></span>`;
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  res.send(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Sentinel — status</title>
+<style>body{font-family:Inter,system-ui,sans-serif;background:#0a0f1a;color:#e6edf3;max-width:680px;margin:40px auto;padding:0 24px}h1{margin:0 0 4px}h2{margin:24px 0 6px;font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:#8b949e}.row{display:flex;align-items:center;padding:8px 0;border-bottom:1px solid #1c2330;font-size:14px}.row span:first-child{flex:1}.muted{color:#8b949e;font-size:12px}</style>
+</head><body>
+<h1>Sentinel — status</h1>
+<div class="muted">${escapeHtml(s.timestamp)} · v${escapeHtml(s.version)}</div>
+<h2>Service</h2>
+<div class="row">${dot(s.db.ok)}<span>API + DB</span><span class="muted">${s.db.ok ? 'reachable in ' + s.db.ms + 'ms' : 'unreachable'}</span></div>
+<h2>Workers</h2>
+${s.workers.length ? s.workers.map(w => `<div class="row">${dot(w.last_run_ok)}<span>${escapeHtml(w.name)}</span><span class="muted">${ago(w.seconds_since)} · ${w.last_run_ms || 0}ms</span></div>`).join('') : '<div class="muted">No worker runs logged yet (system just booted).</div>'}
+<h2 style="margin-top:32px">About</h2>
+<div class="muted">
+Sentinel is a defensive social-media + threat-monitoring platform for Democratic and Indy-aligned political campaigns.
+This page reports operational health only — no customer data is exposed.
+</div>
+</body></html>`);
+});
+
 // ── Customer-facing dashboard + auth routes ────────────────────────
 // Mounted at root so routes are at /login, /dashboard, /dashboard/...
 app.use(require('./routes/dashboard')(pool));
