@@ -20,6 +20,7 @@ const {
   setSessionCookie, clearSessionCookie,
   requireCustomerAuth
 } = require('../lib/auth');
+const { sendThreatAlert, generateWebhookSecret } = require('../lib/alert');
 
 function escapeHtml(s) {
   return String(s == null ? '' : s)
@@ -971,6 +972,41 @@ function build(pool) {
         <button type="submit" class="secondary">Import</button>
       </form>
 
+      <h2>Alert routes</h2>
+      <div class="muted" style="font-size:13px;margin-bottom:10px">
+        Route Tier-3+ alerts to additional destinations (Slack/PagerDuty/Discord webhook, extra emails).
+        If no routes are configured here, alerts go to <code style="background:#0a0f1a;padding:2px 6px;border-radius:3px">${escapeHtml(req.customer.alert_email || 'alert email below')}</code>.
+      </div>
+      ${await renderAlertRoutes(pool, req.customer.id)}
+      <details style="margin-top:14px">
+        <summary style="cursor:pointer;color:#4f9af0;font-size:14px;padding:8px 0">+ Add alert route</summary>
+        <form method="POST" action="/dashboard/settings/alert-routes" style="margin-top:10px;background:#0e1422;padding:14px;border:1px solid #1c2330;border-radius:6px">
+          <div class="field">
+            <label for="channel">Channel</label>
+            <select id="channel" name="channel" style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:14px">
+              <option value="email">email</option>
+              <option value="webhook">webhook (Slack / PagerDuty / Discord / custom)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="destination">Destination (email address OR webhook URL)</label>
+            <input id="destination" name="destination" type="text" required placeholder="ops@campaign.com  OR  https://hooks.slack.com/services/..." style="font-size:13px;font-family:monospace">
+          </div>
+          <div class="field">
+            <label for="label">Label (optional, for your reference)</label>
+            <input id="label" name="label" type="text" placeholder="Slack #threats">
+          </div>
+          <div class="field">
+            <label for="min_tier">Minimum tier</label>
+            <select id="min_tier" name="min_tier" style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:14px">
+              <option value="3" selected>Tier 3+ (credible threats and above)</option>
+              <option value="4">Tier 4 only (imminent violence)</option>
+            </select>
+          </div>
+          <button type="submit">Add route</button>
+        </form>
+      </details>
+
       <h2>Alert + digest emails</h2>
       <form method="POST" action="/dashboard/settings/emails">
         <div class="field">
@@ -1017,6 +1053,75 @@ function build(pool) {
     await pool.query(`UPDATE customers SET contact_email = $1, alert_email = $2, digest_email = $3 WHERE id = $4`,
       [c, a, d, req.customer.id]);
     res.redirect('/dashboard/settings?ok=Emails+updated');
+  });
+
+  // ── Alert routes management ────────────────────────────────────────
+  r.post('/dashboard/settings/alert-routes', authed, express.urlencoded({ extended: false }), async (req, res) => {
+    const channel = req.body.channel;
+    const destination = (req.body.destination || '').trim();
+    const label = (req.body.label || '').trim() || null;
+    const minTier = parseInt(req.body.min_tier, 10) || 3;
+    if (!['email', 'webhook'].includes(channel)) return res.redirect('/dashboard/settings?err=Invalid+channel');
+    if (!destination) return res.redirect('/dashboard/settings?err=Destination+required');
+    if (channel === 'email' && !/.+@.+\..+/.test(destination)) return res.redirect('/dashboard/settings?err=Invalid+email');
+    if (channel === 'webhook' && !/^https?:\/\//i.test(destination)) return res.redirect('/dashboard/settings?err=Webhook+URL+must+start+with+http(s)');
+    if (![3, 4].includes(minTier)) return res.redirect('/dashboard/settings?err=Invalid+tier');
+    const secret = channel === 'webhook' ? generateWebhookSecret() : null;
+    await pool.query(`
+      INSERT INTO alert_routes (customer_id, channel, destination, min_tier, label, secret, active)
+      VALUES ($1, $2, $3, $4, $5, $6, TRUE)
+    `, [req.customer.id, channel, destination, minTier, label, secret]);
+    res.redirect('/dashboard/settings?ok=Alert+route+added' + (channel === 'webhook' ? '+%E2%80%94+secret+shown+once+below' : ''));
+  });
+
+  r.post('/dashboard/settings/alert-routes/:id/delete', authed, express.urlencoded({ extended: false }), async (req, res) => {
+    await pool.query('DELETE FROM alert_routes WHERE id = $1 AND customer_id = $2', [req.params.id, req.customer.id]);
+    res.redirect('/dashboard/settings?ok=Alert+route+removed');
+  });
+
+  r.post('/dashboard/settings/alert-routes/:id/toggle', authed, express.urlencoded({ extended: false }), async (req, res) => {
+    await pool.query('UPDATE alert_routes SET active = NOT active WHERE id = $1 AND customer_id = $2', [req.params.id, req.customer.id]);
+    res.redirect('/dashboard/settings?ok=Alert+route+toggled');
+  });
+
+  r.post('/dashboard/settings/alert-routes/:id/rotate-secret', authed, express.urlencoded({ extended: false }), async (req, res) => {
+    const newSecret = generateWebhookSecret();
+    await pool.query('UPDATE alert_routes SET secret = $1 WHERE id = $2 AND customer_id = $3 AND channel = \'webhook\'', [newSecret, req.params.id, req.customer.id]);
+    res.redirect('/dashboard/settings?ok=Webhook+secret+rotated+%E2%80%94+update+your+receiver');
+  });
+
+  // Send a synthetic test alert through the route (handy for verifying
+  // a webhook endpoint integration before the first real threat fires).
+  r.post('/dashboard/settings/alert-routes/:id/test', authed, express.urlencoded({ extended: false }), async (req, res) => {
+    const q = await pool.query('SELECT * FROM alert_routes WHERE id = $1 AND customer_id = $2', [req.params.id, req.customer.id]);
+    if (!q.rowCount) return res.redirect('/dashboard/settings?err=Route+not+found');
+    const route = q.rows[0];
+    const out = await sendThreatAlert({
+      channel: route.channel,
+      destination: route.destination,
+      secret: route.secret,
+      customerId: req.customer.id,
+      eventId: 'test-' + Date.now(),
+      tier: 3,
+      target: { name: '(synthetic test target)', kind: 'candidate' },
+      customer: { name: req.customer.name },
+      mention: {
+        source: 'synth',
+        source_url: 'https://example.com/synth',
+        body_excerpt: 'This is a Sentinel test alert. If you received this, your alert route is working.',
+        posted_at: new Date(),
+        author_handle: 'sentinel-test',
+        s3_key: null
+      },
+      rationale: 'Synthetic test fired from the dashboard'
+    });
+    if (out.ok) {
+      await pool.query('UPDATE alert_routes SET last_sent_at = NOW(), last_error = NULL WHERE id = $1', [route.id]);
+      res.redirect('/dashboard/settings?ok=Test+alert+sent' + (out.dryRun ? '+%28dry-run%3A+RESEND_API_KEY+not+set%29' : ''));
+    } else {
+      await pool.query('UPDATE alert_routes SET last_error = $2 WHERE id = $1', [route.id, out.error?.slice(0, 500)]);
+      res.redirect('/dashboard/settings?err=' + encodeURIComponent('Test failed: ' + out.error?.slice(0, 100)));
+    }
   });
 
   r.post('/dashboard/settings/password', authed, express.urlencoded({ extended: false }), async (req, res) => {
@@ -1088,6 +1193,52 @@ function build(pool) {
   });
 
   return r;
+}
+
+async function renderAlertRoutes(pool, customerId) {
+  const q = await pool.query(`
+    SELECT id, channel, destination, min_tier, active, label, secret, last_sent_at, last_error, created_at
+    FROM alert_routes
+    WHERE customer_id = $1
+    ORDER BY created_at DESC
+  `, [customerId]);
+  if (!q.rowCount) {
+    return '<div class="empty">No custom alert routes. Tier-3+ alerts go to your default alert email.</div>';
+  }
+  const fmt = (d) => {
+    if (!d) return '—';
+    const dt = d instanceof Date ? d : new Date(d);
+    return dt.toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+  };
+  const rows = q.rows.map(r => {
+    const isWebhook = r.channel === 'webhook';
+    const channelPill = `<span class="status-pill" style="background:${isWebhook ? '#1a3a5c' : '#1c2330'};color:#cfe5ff">${escapeHtml(r.channel)}</span>`;
+    const active = r.active ? '<span class="status-pill" style="background:#1a4a1a;color:#7fff7f">active</span>' : '<span class="status-pill" style="background:#3d301a;color:#d8902f">paused</span>';
+    const secretBlock = isWebhook && r.secret ? `<div class="muted" style="margin-top:6px;font-size:12px">
+      <strong>HMAC secret</strong> (verify <code>X-Sentinel-Signature: sha256=&lt;hmac&gt;</code> against the request body):
+      <div style="background:#0a0f1a;padding:6px 10px;border:1px solid #1c2330;border-radius:3px;font-family:monospace;word-break:break-all;margin-top:4px">${escapeHtml(r.secret)}</div>
+    </div>` : '';
+    const lastError = r.last_error ? `<div class="muted" style="color:#ff7080;font-size:12px;margin-top:6px"><strong>last error:</strong> ${escapeHtml(r.last_error.slice(0, 200))}</div>` : '';
+    return `<div class="card" style="margin-bottom:10px">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        ${channelPill}
+        <strong style="font-size:14px">${escapeHtml(r.label || r.destination)}</strong>
+        <span class="muted" style="font-size:12px">≥ Tier ${r.min_tier}</span>
+        ${active}
+        <span style="margin-left:auto" class="muted">last sent: ${fmt(r.last_sent_at)}</span>
+      </div>
+      ${r.label ? `<div class="muted" style="margin-top:4px;font-size:12px;font-family:monospace;word-break:break-all">${escapeHtml(r.destination)}</div>` : ''}
+      ${secretBlock}
+      ${lastError}
+      <div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap">
+        <form method="POST" action="/dashboard/settings/alert-routes/${r.id}/test"><button type="submit" class="secondary" style="padding:4px 10px;font-size:12px">Send test</button></form>
+        <form method="POST" action="/dashboard/settings/alert-routes/${r.id}/toggle"><button type="submit" class="secondary" style="padding:4px 10px;font-size:12px">${r.active ? 'Pause' : 'Resume'}</button></form>
+        ${isWebhook ? `<form method="POST" action="/dashboard/settings/alert-routes/${r.id}/rotate-secret" onsubmit="return confirm('Rotate the HMAC secret? You will need to update your receiver.');"><button type="submit" class="secondary" style="padding:4px 10px;font-size:12px">Rotate secret</button></form>` : ''}
+        <form method="POST" action="/dashboard/settings/alert-routes/${r.id}/delete" onsubmit="return confirm('Delete this alert route?');"><button type="submit" class="danger" style="padding:4px 10px;font-size:12px">Delete</button></form>
+      </div>
+    </div>`;
+  }).join('');
+  return rows;
 }
 
 function parseTargetForm(body) {

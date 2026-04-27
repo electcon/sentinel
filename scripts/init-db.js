@@ -123,13 +123,22 @@ async function initSchema(pool) {
     CREATE TABLE IF NOT EXISTS alert_routes (
       id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       customer_id   UUID NOT NULL REFERENCES customers(id),
-      channel       TEXT NOT NULL,        -- 'email' | 'sms' (later) | 'webhook'
-      destination   TEXT NOT NULL,
+      channel       TEXT NOT NULL,        -- 'email' | 'webhook' | 'sms' (later)
+      destination   TEXT NOT NULL,        -- email addr OR webhook URL
       min_tier      SMALLINT NOT NULL DEFAULT 3,
       active        BOOLEAN NOT NULL DEFAULT TRUE,
+      label         TEXT,                  -- human-readable name ("Slack #threats")
+      secret        TEXT,                  -- HMAC key for webhook signing (NULL for email)
+      last_sent_at  TIMESTAMPTZ,
+      last_error    TEXT,
       created_at    TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+  await pool.query(`ALTER TABLE alert_routes ADD COLUMN IF NOT EXISTS label TEXT`);
+  await pool.query(`ALTER TABLE alert_routes ADD COLUMN IF NOT EXISTS secret TEXT`);
+  await pool.query(`ALTER TABLE alert_routes ADD COLUMN IF NOT EXISTS last_sent_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE alert_routes ADD COLUMN IF NOT EXISTS last_error TEXT`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS alert_routes_active ON alert_routes (customer_id, active) WHERE active = TRUE`);
 }
 
 module.exports = initSchema;

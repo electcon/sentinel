@@ -21,15 +21,17 @@ const { sendThreatAlert } = require('../lib/alert');
 
 const MAX_PER_RUN = parseInt(process.env.ALERT_MAX_PER_RUN, 10) || 25;
 
-async function loadDestinations(pool, customerId, tier) {
+async function loadRoutes(pool, customerId, tier) {
+  // Channel-aware: email + webhook + future SMS.
   const r = await pool.query(`
-    SELECT destination FROM alert_routes
-    WHERE customer_id = $1 AND active = TRUE AND channel = 'email' AND min_tier <= $2
+    SELECT id, channel, destination, secret, label FROM alert_routes
+    WHERE customer_id = $1 AND active = TRUE AND min_tier <= $2 AND channel IN ('email', 'webhook')
   `, [customerId, tier]);
-  if (r.rowCount > 0) return r.rows.map(x => x.destination);
-  // Fall back to customer.alert_email if no per-route configured.
+  if (r.rowCount > 0) return r.rows;
+  // Fall back to customer.alert_email as a single email route.
   const c = await pool.query('SELECT alert_email FROM customers WHERE id = $1', [customerId]);
-  return c.rows[0]?.alert_email ? [c.rows[0].alert_email] : [];
+  if (c.rows[0]?.alert_email) return [{ id: null, channel: 'email', destination: c.rows[0].alert_email, secret: null, label: '(default)' }];
+  return [];
 }
 
 async function runOnce({ pool, log = console.log }) {
@@ -67,16 +69,20 @@ async function runOnce({ pool, log = console.log }) {
   let failed = 0;
   let dryRun = 0;
   for (const row of r.rows) {
-    const destinations = await loadDestinations(pool, row.customer_id, row.tier);
-    if (!destinations.length) {
-      log(`[alert] no destinations for customer ${row.customer_id} — skipping event ${row.event_id}`);
+    const routes = await loadRoutes(pool, row.customer_id, row.tier);
+    if (!routes.length) {
+      log(`[alert] no routes for customer ${row.customer_id} — skipping event ${row.event_id}`);
       continue;
     }
 
     let allOk = true;
-    for (const dest of destinations) {
+    for (const route of routes) {
       const out = await sendThreatAlert({
-        alertEmail: dest,
+        channel: route.channel,
+        destination: route.destination,
+        secret: route.secret,
+        customerId: row.customer_id,
+        eventId: row.event_id,
         tier: row.tier,
         target: { name: row.target_name, kind: row.target_kind },
         customer: { name: row.customer_name },
@@ -91,8 +97,14 @@ async function runOnce({ pool, log = console.log }) {
         rationale: row.rationale
       });
       if (out.dryRun) dryRun++;
-      if (!out.ok) { allOk = false; log(`[alert] send FAILED to ${dest}: ${out.error}`); }
-      else log(`[alert] sent T${row.tier} → ${dest}${out.dryRun ? ' (dry-run)' : ''}`);
+      if (!out.ok) {
+        allOk = false;
+        log(`[alert] send FAILED via ${route.channel} to ${route.destination}: ${out.error}`);
+        if (route.id) await pool.query('UPDATE alert_routes SET last_error = $2 WHERE id = $1', [route.id, out.error.slice(0, 500)]).catch(() => {});
+      } else {
+        log(`[alert] sent T${row.tier} via ${route.channel} → ${route.destination}${out.dryRun ? ' (dry-run)' : ''}`);
+        if (route.id) await pool.query('UPDATE alert_routes SET last_sent_at = NOW(), last_error = NULL WHERE id = $1', [route.id]).catch(() => {});
+      }
     }
 
     if (allOk) {
