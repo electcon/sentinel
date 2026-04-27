@@ -106,10 +106,69 @@ async function main() {
   console.log('digest email:   ', spec.digest_email);
   console.log('targets:        ', (spec.targets || []).length);
   console.log('-----');
-  console.log('Send the login URL + shared password to the customer via a secure channel.');
-  console.log('Do NOT email the password as plaintext if avoidable.');
+
+  // Optional: send a welcome email if Resend is configured AND --send-welcome
+  // is passed. Default OFF so manually re-running this script doesn't spam.
+  if (process.env.RESEND_API_KEY && process.argv.includes('--send-welcome')) {
+    try {
+      await sendWelcomeEmail({ spec, loginUrl });
+      console.log('[provision] welcome email sent →', spec.contact_email);
+    } catch (e) {
+      console.error('[provision] welcome email FAILED:', e.message);
+    }
+  } else {
+    console.log('Send the login URL + shared password to the customer via a secure channel.');
+    console.log('Do NOT email the password as plaintext if avoidable.');
+    if (process.env.RESEND_API_KEY) {
+      console.log('Or: re-run with --send-welcome to send the templated welcome email.');
+    }
+  }
 
   await pool.end();
+}
+
+async function sendWelcomeEmail({ spec, loginUrl }) {
+  const { Resend } = require('resend');
+  const resend = new Resend(process.env.RESEND_API_KEY);
+  const from = process.env.WELCOME_FROM_EMAIL || 'Sentinel <hello@voteroi.com>';
+  const text = [
+    `Hi — welcome to Sentinel.`,
+    ``,
+    `Your account is provisioned. Login here:`,
+    `  ${loginUrl}`,
+    ``,
+    `Email:    ${spec.contact_email}`,
+    `Password: ${spec.password}`,
+    ``,
+    `(Change the password on first login: Settings → Change password.)`,
+    ``,
+    `Tier-3+ alerts go to:  ${spec.alert_email}`,
+    `Daily digests go to:   ${spec.digest_email}`,
+    ``,
+    `Targets configured at onboarding:`,
+    ...(spec.targets || []).map(t => `  • ${t.name} (${t.kind || 'candidate'})`),
+    ``,
+    `If anything looks wrong, reply to this email.`,
+    ``,
+    `— David Wheeler, Sentinel`
+  ].join('\n');
+  const html = `<div style="font-family:Inter,system-ui,sans-serif;max-width:560px;margin:0 auto;color:#0a0f1a;line-height:1.5">
+    <h2>Welcome to Sentinel</h2>
+    <p>Your account is provisioned and ingest is running.</p>
+    <p><strong>Login:</strong> <a href="${loginUrl}">${loginUrl}</a><br>
+       <strong>Email:</strong> ${spec.contact_email}<br>
+       <strong>Password:</strong> <code style="background:#f4f6f8;padding:2px 6px;border-radius:4px">${spec.password}</code>
+       <br><span style="color:#666;font-size:13px">Change on first login: Settings → Change password.</span>
+    </p>
+    <p><strong>Tier-3+ alerts:</strong> ${spec.alert_email}<br>
+       <strong>Daily digest:</strong> ${spec.digest_email}</p>
+    <p><strong>Targets monitored:</strong></p>
+    <ul>${(spec.targets || []).map(t => `<li>${t.name} <span style="color:#666;font-size:13px">(${t.kind || 'candidate'})</span></li>`).join('')}</ul>
+    <p>Reply to this email if anything looks wrong.</p>
+    <p>— David Wheeler, Sentinel</p>
+  </div>`;
+  const r = await resend.emails.send({ from, to: spec.contact_email, subject: `Welcome to Sentinel — ${spec.name}`, text, html });
+  if (r.error) throw new Error(r.error.message || JSON.stringify(r.error));
 }
 
 function validateSpec(s) {

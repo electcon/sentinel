@@ -607,6 +607,110 @@ function build(pool) {
     res.send(layout({ title: 'Mentions', customer: req.customer, body, active: 'mentions' }));
   });
 
+  // ── CSV export for mentions ────────────────────────────────────────
+  r.get('/dashboard/mentions.csv', auth, async (req, res) => {
+    const tierFilter = req.query.tier;
+    const sourceFilter = req.query.source;
+    const search = (req.query.q || '').trim().slice(0, 200);
+    const args = [req.customer.id];
+    const wheres = [];
+    if (tierFilter && /^[1-4]$/.test(tierFilter)) {
+      args.push(parseInt(tierFilter, 10));
+      wheres.push(`m.threat_tier = $${args.length}`);
+    }
+    if (sourceFilter && /^[a-z_]+$/i.test(sourceFilter)) {
+      args.push(sourceFilter);
+      wheres.push(`m.source = $${args.length}`);
+    }
+    if (search) {
+      args.push('%' + search + '%');
+      wheres.push(`m.body_excerpt ILIKE $${args.length}`);
+    }
+    const whereClause = wheres.length ? 'AND ' + wheres.join(' AND ') : '';
+    const q = await pool.query(`
+      SELECT m.id, m.threat_tier, m.sentiment, m.source, m.source_id, m.source_url,
+             m.author_handle, m.posted_at, m.ingested_at, m.body_excerpt, m.rationale,
+             m.classifier_v, m.s3_key, t.name AS target_name, t.kind AS target_kind
+      FROM mentions m
+      LEFT JOIN targets t ON t.id = m.target_id
+      WHERE m.customer_id = $1 ${whereClause}
+      ORDER BY m.ingested_at DESC
+      LIMIT 5000
+    `, args);
+    const cols = ['id','threat_tier','sentiment','source','source_id','source_url','author_handle',
+                  'posted_at','ingested_at','body_excerpt','rationale','classifier_v','s3_key',
+                  'target_name','target_kind'];
+    res.set('Content-Type', 'text/csv; charset=utf-8');
+    res.set('Content-Disposition', `attachment; filename="sentinel-mentions-${new Date().toISOString().slice(0,10)}.csv"`);
+    res.write(cols.join(',') + '\n');
+    for (const row of q.rows) res.write(cols.map(c => csvCell(row[c])).join(',') + '\n');
+    res.end();
+  });
+
+  r.get('/dashboard/threats.csv', auth, async (req, res) => {
+    const q = await pool.query(`
+      SELECT te.id, te.tier, te.status, te.created_at, te.alerted_at, te.resolved_at, te.notes,
+             m.source, m.source_url, m.author_handle, m.posted_at, m.body_excerpt,
+             t.name AS target_name, t.kind AS target_kind
+      FROM threat_events te
+      JOIN mentions m ON m.id = te.mention_id
+      LEFT JOIN targets t ON t.id = te.target_id
+      WHERE te.customer_id = $1
+      ORDER BY te.tier DESC, te.created_at DESC
+      LIMIT 5000
+    `, [req.customer.id]);
+    const cols = ['id','tier','status','created_at','alerted_at','resolved_at','notes',
+                  'source','source_url','author_handle','posted_at','body_excerpt',
+                  'target_name','target_kind'];
+    res.set('Content-Type', 'text/csv; charset=utf-8');
+    res.set('Content-Disposition', `attachment; filename="sentinel-threats-${new Date().toISOString().slice(0,10)}.csv"`);
+    res.write(cols.join(',') + '\n');
+    for (const row of q.rows) res.write(cols.map(c => csvCell(row[c])).join(',') + '\n');
+    res.end();
+  });
+
+  // ── Targets bulk import ────────────────────────────────────────────
+  r.post('/dashboard/targets/bulk-import', auth, express.urlencoded({ extended: false, limit: '256kb' }), async (req, res) => {
+    const text = (req.body.bulk || '').trim();
+    if (!text) return res.redirect('/dashboard/settings?err=No+input');
+
+    let parsed;
+    let format;
+    if (text.startsWith('[') || text.startsWith('{')) {
+      try {
+        parsed = JSON.parse(text);
+        if (!Array.isArray(parsed)) parsed = [parsed];
+        format = 'json';
+      } catch (e) {
+        return res.redirect('/dashboard/settings?err=Invalid+JSON%3A+' + encodeURIComponent(e.message.slice(0, 80)));
+      }
+    } else {
+      // Plaintext: each non-empty line is a target name. No aliases or search_terms.
+      parsed = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean).map(name => ({ name, kind: 'candidate' }));
+      format = 'plaintext';
+    }
+
+    let created = 0;
+    let updated = 0;
+    let skipped = 0;
+    for (const t of parsed) {
+      if (!t || !t.name) { skipped++; continue; }
+      const kindRaw = String(t.kind || 'candidate').trim();
+      const kind = ['candidate','family','staff','surrogate'].includes(kindRaw) ? kindRaw : 'candidate';
+      const aliases = Array.isArray(t.aliases) ? t.aliases : [];
+      const search_terms = Array.isArray(t.search_terms) ? t.search_terms : [];
+      const r2 = await pool.query(`
+        INSERT INTO targets (customer_id, kind, name, aliases, search_terms)
+        VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
+        ON CONFLICT (customer_id, name) DO UPDATE
+        SET kind = EXCLUDED.kind, aliases = EXCLUDED.aliases, search_terms = EXCLUDED.search_terms
+        RETURNING (xmax = 0) AS inserted
+      `, [req.customer.id, kind, t.name, JSON.stringify(aliases), JSON.stringify(search_terms)]);
+      if (r2.rows[0].inserted) created++; else updated++;
+    }
+    res.redirect(`/dashboard/settings?ok=Imported+${created}+new+%2F+${updated}+updated+%28${format}%29${skipped ? '+%2F+' + skipped + '+skipped' : ''}`);
+  });
+
   // ── Mention detail ─────────────────────────────────────────────────
   r.get('/dashboard/mentions/:id', auth, async (req, res) => {
     const q = await pool.query(`
@@ -680,9 +784,23 @@ function build(pool) {
         <thead><tr><th>Kind</th><th>Name</th><th>Aliases</th><th>Search terms</th><th></th><th></th></tr></thead>
         <tbody>${targetRows}</tbody>
       </table>` : '<div class="empty">No targets yet.</div>'}
-      <div style="margin-top:14px">
-        <a href="/dashboard/targets/new"><button>+ Add target</button></a>
+      <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
+        <a href="/dashboard/targets/new"><button type="button">+ Add target</button></a>
+        <a href="/dashboard/mentions.csv"><button type="button" class="secondary">↓ Export mentions CSV</button></a>
+        <a href="/dashboard/threats.csv"><button type="button" class="secondary">↓ Export threats CSV</button></a>
       </div>
+
+      <h2>Bulk import targets</h2>
+      <form method="POST" action="/dashboard/targets/bulk-import">
+        <div class="muted" style="margin-bottom:6px;font-size:13px">
+          Paste a JSON array of target objects, OR one target name per line. JSON supports the full schema:
+          <code style="background:#0a0f1a;padding:2px 6px;border-radius:3px">{"kind":"candidate","name":"Jane Doe","aliases":["Doe"],"search_terms":["Jane Doe"]}</code>
+        </div>
+        <div class="field">
+          <textarea name="bulk" rows="6" placeholder='Either:&#10;Jane Doe&#10;John Smith&#10;&#10;Or:&#10;[&#10;  {"kind":"candidate","name":"Jane Doe","aliases":["Doe"],"search_terms":["Jane Doe"]},&#10;  {"kind":"family","name":"John Doe"}&#10;]' style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px 12px;border-radius:4px;font-size:13px;width:100%;font-family:monospace"></textarea>
+        </div>
+        <button type="submit" class="secondary">Import</button>
+      </form>
 
       <h2>Alert + digest emails</h2>
       <form method="POST" action="/dashboard/settings/emails">
@@ -880,6 +998,18 @@ function renderVolumeChart(rows) {
       ${legend}
     </svg>
   </div>`;
+}
+
+// CSV cell escaper. Wraps anything containing comma, quote, or newline in
+// double quotes; doubles internal quotes per RFC 4180.
+function csvCell(v) {
+  if (v == null) return '';
+  let s;
+  if (v instanceof Date) s = v.toISOString();
+  else if (typeof v === 'object') s = JSON.stringify(v);
+  else s = String(v);
+  if (/[",\n\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
 }
 
 function csvSplit(s) {
