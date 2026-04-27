@@ -17,9 +17,9 @@ const { hashPassword } = require('../lib/auth');
 
 const DEV_CUSTOMER = {
   name: 'Sentinel Dev (test)',
-  contact_email: 'david@voteroi.com',
-  alert_email: 'david@voteroi.com',
-  digest_email: 'david@voteroi.com',
+  contact_email: 'david@americanmuckrakers.com',
+  alert_email: 'david@americanmuckrakers.com',
+  digest_email: 'david@americanmuckrakers.com',
   status: 'beta'
 };
 
@@ -85,8 +85,16 @@ async function main() {
   let customerId;
   if (existing.rowCount > 0) {
     customerId = existing.rows[0].id;
-    // Reset password on every duplicate so login works whichever gets picked.
-    await pool.query('UPDATE customers SET password_hash = $1 WHERE name = $2', [passwordHash, DEV_CUSTOMER.name]);
+    // Reset password + sync email addresses on every duplicate so login + delivery
+    // work whichever row gets picked. Useful when DEV_CUSTOMER constants change.
+    await pool.query(`
+      UPDATE customers
+      SET password_hash = $1,
+          contact_email = $2,
+          alert_email = $3,
+          digest_email = $4
+      WHERE name = $5
+    `, [passwordHash, DEV_CUSTOMER.contact_email, DEV_CUSTOMER.alert_email, DEV_CUSTOMER.digest_email, DEV_CUSTOMER.name]);
     console.log('[seed] customer exists (using id with most mentions):', customerId, '— mentions:', existing.rows[0].mention_count);
     if (existing.rowCount > 1) {
       console.log('[seed] WARN —', existing.rowCount, 'duplicate dev customers. Run /api/_smoke/cleanup-duplicates if needed.');
