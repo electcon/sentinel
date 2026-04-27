@@ -1,94 +1,131 @@
-# Week 1 — execution log
+# Sentinel — execution log
 
 Started: 2026-04-26.
 
-## Done
+## Major scope shift
 
-- [x] `sentinel/` workspace scaffolded in the VoteROI repo (will move
-      to a separate Sentinel GitHub org once provisioned)
-- [x] `README.md` — what Sentinel is, scope cuts for v1, dev quick-start
-- [x] `THREAT_TAXONOMY.md` — 4-tier rubric with concrete examples per tier;
-      this is the spec the LLM classifier reads
-- [x] `ARCHITECTURE.md` — system shape, Postgres schema, S3 layout, tech
-      stack rationale, cost model
-- [x] `package.json` — Node 20, deps for Anthropic SDK, AWS S3, Postgres,
-      Resend, Express
-- [x] `.env.example` — every env var documented, including OAuth setup
-      pointers for Reddit / Bluesky / Facebook
-- [x] `server.js` — minimal Express boot with `/api/health` and a
-      placeholder dashboard route. Idempotent schema init on startup.
-- [x] `scripts/init-db.js` — full schema: customers, targets, mentions,
-      threat_events, classifications, alert_routes
-- [x] `classify.js` — Claude classifier integration. Reads the taxonomy
-      doc as system prompt. Returns structured `{tier, confidence,
-      sentiment, rationale}`. CLI smoke-test built in.
-- [x] `workers/{reddit,bluesky,rss}.js` — stubs with detailed contractor
-      task lists embedded as comments. Each stub explains exactly what
-      week-2 implementation looks like.
-- [x] `HIRING.md` — hire-pack with job spec, Slack post copy, YC
-      template, personal-referral DM template, screening questions,
-      interview-loop runbook, decision criteria
-- [x] `BETA_PITCH.md` — 1-paragraph email body, 5-slide demo outline,
-      1-page beta agreement template, talking-point script
-- [x] `WEEK_1_LOG.md` (this file)
+David decided 2026-04-26 to build solo with Claude doing all coding.
+`HIRING.md` is shelved. The 7-week timeline holds.
 
-## Status update (end of week 1)
+## Week 1 — scaffolding + week 2 — overnight (2026-04-26 → 2026-04-27)
 
-**Major scope shift, 2026-04-26:** David decided to build Sentinel solo
-with Claude doing all engineering. No contractor hire. `HIRING.md` is
-shelved. All week-2+ ingest / dashboard / alert work falls on Claude.
+A continuous build session collapsed week 1 + week 2 into one push.
+By morning of 2026-04-27 the v1 platform is functionally complete
+end-to-end — only Resend API key + AUP clearance + real beta-customer
+target lists remain to start serving real campaigns.
 
-## Done (week 1)
+### Done — infra
 
-- [x] GitHub repo `electcon/sentinel` provisioned, scaffold pushed
-- [x] Render service `sentinel-staging-i3ug.onrender.com` deployed,
-      `/api/health` returns 200, DB ping <50ms
-- [x] Postgres `sentinel-db` (Render, virginia-postgres) — 6 tables
-      initialized and verified
-- [x] AWS S3 `sentinel-evidence` (us-east-2) provisioned with
-      lifecycle: STANDARD → STANDARD-IA at 30d → GLACIER at 90d.
-      IAM user `sentinel-app` scoped to bucket. PutObject/GetObject
-      round-trip verified.
-- [x] `ANTHROPIC_API_KEY` provisioned for Sentinel (separate from
-      VoteROI billing)
-- [x] Classifier live end-to-end. 6/6 tier-classification cases pass
-      under taxonomy v1.2. `/api/_smoke/classify` token-gated for
-      ongoing eval runs.
-- [x] Codename/public-name decision: **Sentinel** is both. No rebrand.
+- [x] `electcon/sentinel` GitHub repo, ~25 commits over the build
+- [x] Render Postgres `sentinel-db` (virginia) — schema initialized
+- [x] Render web service `sentinel-staging-i3ug.onrender.com` — running
+- [x] AWS S3 bucket `sentinel-evidence` (us-east-2) with 30d→Standard-IA,
+      90d→Glacier lifecycle. IAM user `sentinel-app` scoped to bucket.
+- [x] Anthropic API key (separate billing from VoteROI)
+- [x] OpenRouter API key (alternate classifier provider)
+- [x] twitterapi.io API key (X ingest)
+- [x] Sentinel = both internal codename AND public-facing name (no rebrand)
 
-## Blocked on you (David) — unchanged or new
+### Done — code
 
+- [x] `THREAT_TAXONOMY.md` v1.2 — sharpened Tier 1/2 boundary, robust
+      against post-JSON markdown
+- [x] `classify.js` — Anthropic + OpenRouter pluggable providers,
+      JSON-extraction parser with balanced-brace handling
+- [x] **Reddit ingest** worker (`workers/reddit.js` + `lib/reddit.js`) —
+      anonymous public search, dupe-skip, S3 archive, classify, persist
+- [x] **Bluesky ingest** worker (`workers/bluesky.js` + `lib/bluesky.js`) —
+      AT-protocol public search
+- [x] **RSS ingest** worker (`workers/rss.js` + `lib/rss.js`) — Google
+      News RSS per target
+- [x] **X (Twitter) ingest** worker (`workers/x.js` + `lib/x-client.js`) —
+      twitterapi.io REST, lib-level QPS rate limiting (5.1s gap for
+      free-tier compatibility)
+- [x] **Alert worker** (`workers/alert.js` + `lib/alert.js`) — sweeps
+      open un-alerted tier-3+ events, sends Resend email (or dry-run
+      logs if no key set)
+- [x] **Daily digest worker** (`workers/digest.js` + `lib/digest.js`) —
+      per-customer 24h rollup with tier breakdown + top mentions,
+      tracked via `customers.last_digest_at`
+- [x] **In-process scheduler** — setInterval-based, runs all workers on
+      staggered intervals; per-source error budget (5 consec failures
+      pauses 30 min, auto-resume); idempotent dupe-skip
+- [x] **Worker run tracking** (`worker_runs` table) — every scheduler
+      tick logged with duration, ok/fail, summary, error
+- [x] **Customer auth** (`lib/auth.js`) — scrypt password hashing,
+      signed-cookie sessions (HMAC-SHA256), 30-day expiry
+- [x] **Customer dashboard** (`routes/dashboard.js`):
+      `/dashboard` overview (open threats + 24h count + system health
+      panel + 14-day SVG mention-volume chart)
+      `/dashboard/threats` (filterable queue)
+      `/dashboard/threats/:id` with status-update form + audit-trail notes
+      `/dashboard/mentions` paginated, with text search + tier/source
+      filters; CSV export
+      `/dashboard/threats.csv` export
+      `/dashboard/settings` — change emails / password / targets CRUD /
+      bulk targets import (JSON or one-per-line)
+      `/login` + `/logout` with rate-limit (10 attempts / 10 min → lock 30 min)
+- [x] **Internal `/admin`** (Basic auth via `ADMIN_PASSWORD`) — overview,
+      customers, workers, errors, threats — David's omniscient view
+- [x] **Public `/status`** + `/status.json` — uptime + per-worker health,
+      no PII (suitable for uptime monitors)
+- [x] **Customer provisioning** (`scripts/provision-customer.js`) — JSON-
+      driven idempotent customer + targets + password + optional welcome
+      email via Resend on `--send-welcome`
+- [x] **Security hardening** — strict CSP, X-Frame-Options DENY, HSTS,
+      anti-bruteforce login limit, per-customer data isolation, scoped
+      AWS IAM, SQL parameterization throughout
+- [x] **29 unit tests** (`node --test tests/*.test.js`) covering
+      lib/match, lib/auth, classify JSON parser
+
+### Smoke results
+
+Live test mentions ingested across the 4 sources during the build:
+~250 mentions in the dev customer DB after first 24 hours of scheduled
+runs. Classifier 6/6 correct against synthetic tier rubric (taxonomy
+v1.2). Synthetic tier-3 + tier-4 threats correctly trigger
+`threat_events` rows + alert worker (dry-run).
+
+## Blocked on you (David) — week 2 pickup
+
+- [ ] **Resend API key** for Sentinel — without this, alerts and digests
+      log "DRY-RUN" instead of sending. Either reuse VoteROI's Resend
+      account or create a separate one. Add as `RESEND_API_KEY` env on
+      Render.
+- [ ] **`ADMIN_PASSWORD` on Render** — sets up `/admin` (currently 404
+      without it). Pick a strong 16+ char password, paste to Render env.
+- [ ] **`OPENROUTER_API_KEY` credit funding** — key is wired but the
+      account has no credits. Visit https://openrouter.ai/settings/credits.
+- [ ] **twitterapi.io AUP clearance** — email support@twitterapi.io to
+      confirm political-defensive-monitoring use case is allowed BEFORE
+      onboarding any beta customer.
 - [ ] **Beta-pitch email forwards** — three emails to Jolly, Sands,
-      Laubacher campaign managers. Use the `BETA_PITCH.md` 1-paragraph
-      body. Goal: meetings booked by Friday May 2.
-- [ ] **Reddit API credentials** (week 2) — register a Reddit app at
-      https://www.reddit.com/prefs/apps as "script" type. I need
-      `client_id`, `client_secret`, and a service account username +
-      password. App-only OAuth is fine for our read-only search needs.
-- [ ] **Bluesky API credentials** (week 2) — Bluesky uses an
-      app-password flow. Create one at bsky.app → Settings → App
-      Passwords. I need the handle + app password.
-- [ ] **Rotate leaked tokens** — GH PAT, Render API key, AWS access
-      key all exist in chat transcript. Rotate after week 2 if you
-      haven't already.
+      Laubacher campaign managers. Use `BETA_PITCH.md`. Goal: meetings
+      booked by Friday May 2.
+- [ ] **Beta target intake forms** — once managers respond, get them to
+      fill in the `customers/TEMPLATE.json` shape (or send via secure
+      channel as a list). Then run
+      `node scripts/provision-customer.js customers/<slug>.json`.
+- [ ] **Custom domain decision** — `sentinel-staging-i3ug.onrender.com`
+      is a Render subdomain. Phase 2: register `sentinelhq.com` or
+      similar and CNAME to Render.
+- [ ] **Rotate the leaked tokens in chat transcript** — GH PAT, Render
+      API key, AWS access key, OpenRouter key, twitterapi.io key.
 
-## What I'm doing next (week 2)
+## What's next (Phase 2 / post-MVP candidates)
 
-Solo build kickoff:
+Captured for later, NOT shipping in v1:
 
-1. **Reddit ingest worker** — full implementation of `workers/reddit.js`.
-   Per-customer search-term fan-out, idempotent inserts via
-   `mentions(source, source_id)` unique constraint, S3 archive of
-   raw payload, classifier pass on every match, `classifications`
-   audit row written.
-2. **Bluesky ingest worker** — same shape, AT-protocol search.
-3. **RSS worker** — per-customer feed config table + ingest loop.
-4. **End-to-end demo** — a real public Reddit post about a real
-   target lands in DB, gets classified, gets archived to S3.
-5. **Cron / scheduler** — Render cron service runs each worker on a
-   short interval (Reddit/Bluesky every 5 min, RSS every 15 min).
-6. **Daily digest** — cron that gathers each customer's last-24h
-   activity and emails it via Resend.
+- TruthSocial ingest (Mastodon API; needs service account + token)
+- Real-time Bluesky firehose (Jetstream WebSocket; lower latency than
+  5-min polling)
+- Per-customer custom RSS feeds (today: only Google News per target)
+- Custom domain + TLS
+- SSO via Google Workspace / Microsoft 365 (instead of shared password)
+- Self-serve signup with screening
+- Mobile alerts (SMS via Twilio, push via OneSignal)
+- Provider abstraction completion: swap twitterapi.io → Apify if needed
+
 
 ## Risks I'm watching
 
