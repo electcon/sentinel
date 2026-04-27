@@ -17,6 +17,8 @@
     "ingest:bluesky": "node workers/bluesky.js",
     "ingest:rss": "node workers/rss.js",
     "ingest:x": "node workers/x.js",
+    "ingest:telegram": "node workers/telegram.js",
+    "ingest:cisa": "node workers/cisa.js",
     "alert:run": "node workers/alert.js",
     "digest:run": "node workers/digest.js",
     "digest:force": "node workers/digest.js --force"

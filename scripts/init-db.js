@@ -133,6 +133,41 @@ async function initSchema(pool) {
   await pool.query(`CREATE INDEX IF NOT EXISTS classifier_feedback_recent ON classifier_feedback (created_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS classifier_feedback_source_action ON classifier_feedback (source, reviewer_action, created_at DESC)`);
 
+  // Cyber indicators ingested from CISA AIS (TAXII 2.1) or other future
+  // threat-intel sources. Used for cross-referencing URLs / domains in
+  // mention bodies. v1 just stores; cross-ref is Phase 2.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS cyber_indicators (
+      id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      source          TEXT NOT NULL,         -- 'cisa_ais' | future...
+      stix_id         TEXT,                  -- STIX object id (deduped against this)
+      kind            TEXT NOT NULL,         -- 'domain' | 'ipv4' | 'sha256' | 'url' | etc.
+      value           TEXT NOT NULL,
+      pattern         TEXT,
+      confidence      INTEGER,
+      labels          JSONB DEFAULT '[]',
+      description     TEXT,
+      valid_from      TIMESTAMPTZ,
+      valid_until     TIMESTAMPTZ,
+      first_seen_at   TIMESTAMPTZ DEFAULT NOW(),
+      last_seen_at    TIMESTAMPTZ DEFAULT NOW(),
+      raw             JSONB,
+      UNIQUE (source, stix_id)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS cyber_indicators_kind_value ON cyber_indicators (kind, value)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS cyber_indicators_recent ON cyber_indicators (last_seen_at DESC)`);
+
+  // Track per-source poll cursor (TAXII added_after etc.) for incremental ingest.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ingest_state (
+      source        TEXT PRIMARY KEY,
+      cursor        TEXT,
+      last_run_at   TIMESTAMPTZ,
+      updated_at    TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
   // Per-tick worker run log. Lets the dashboard show "last ran X
   // minutes ago, processed N items, errored Y times." Old rows
   // pruned by a periodic VACUUM-style cleanup; for now we keep ~7d.

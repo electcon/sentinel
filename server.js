@@ -151,6 +151,43 @@ app.post('/api/_smoke/x-run', requireSmokeToken, async (req, res) => {
   }
 });
 
+// Trigger one Telegram ingest run.
+app.post('/api/_smoke/telegram-run', requireSmokeToken, async (req, res) => {
+  try {
+    const { runOnce } = require('./workers/telegram');
+    const log = (m) => console.log(m);
+    const summary = await runOnce({ pool, log });
+    res.json(summary);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Trigger one CISA AIS poll. No-op if CISA_TAXII_* env vars unset.
+app.post('/api/_smoke/cisa-run', requireSmokeToken, async (req, res) => {
+  try {
+    const { runOnce } = require('./workers/cisa');
+    const summary = await runOnce({ pool, log: console.log });
+    res.json(summary);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// FBI CDE risk summary for a state. ?state=NH (postal abbreviation).
+// Smoke-token gated.
+app.get('/api/_smoke/fbi-state-stats', requireSmokeToken, async (req, res) => {
+  try {
+    const state = String(req.query.state || '').toUpperCase();
+    if (!/^[A-Z]{2}$/.test(state)) return res.status(400).json({ error: 'pass ?state=XX (2-letter abbrev)' });
+    const { riskSummaryForState } = require('./lib/fbi-cde');
+    const out = await riskSummaryForState(state);
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Idempotent dev-customer seeder. POST to provision the test customer
 // and dev targets (Cinde Warmington, Eileen Laubacher, Charlie Crist).
 app.post('/api/_smoke/seed-dev', requireSmokeToken, async (req, res) => {
@@ -433,7 +470,9 @@ const SCHEDULES = [
   { name: 'bluesky', intervalMs:  5 * 60 * 1000,     startupDelayMs: 30 * 1000, run: () => require('./workers/bluesky').runOnce({ pool, log: scheduledLog('bluesky') }) },
   { name: 'reddit',  intervalMs: 10 * 60 * 1000,     startupDelayMs: 60 * 1000, run: () => require('./workers/reddit').runOnce({ pool, log: scheduledLog('reddit') }) },
   { name: 'rss',     intervalMs: 15 * 60 * 1000,     startupDelayMs: 90 * 1000, run: () => require('./workers/rss').runOnce({ pool, log: scheduledLog('rss') }) },
-  { name: 'x',       intervalMs:  5 * 60 * 1000,     startupDelayMs: 100 * 1000, run: () => require('./workers/x').runOnce({ pool, log: scheduledLog('x') }) },
+  { name: 'x',         intervalMs:  5 * 60 * 1000,     startupDelayMs: 100 * 1000, run: () => require('./workers/x').runOnce({ pool, log: scheduledLog('x') }) },
+  { name: 'telegram',  intervalMs: 10 * 60 * 1000,     startupDelayMs: 110 * 1000, run: () => require('./workers/telegram').runOnce({ pool, log: scheduledLog('telegram') }) },
+  { name: 'cisa',      intervalMs: 60 * 60 * 1000,     startupDelayMs: 240 * 1000, run: () => require('./workers/cisa').runOnce({ pool, log: scheduledLog('cisa') }) },
   { name: 'digest',  intervalMs: 30 * 60 * 1000,     startupDelayMs: 120 * 1000, run: () => require('./workers/digest').runOnce({ pool, log: scheduledLog('digest') }) },
   { name: 'cleanup', intervalMs: 60 * 60 * 1000,     startupDelayMs: 180 * 1000, run: async () => {
       // Prune worker_runs > 7d so the table doesn't grow unbounded.
