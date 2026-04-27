@@ -348,16 +348,31 @@ function build(pool) {
 
     // Build 14-day chart: stacked SVG bars by tier.
     const chartHtml = renderVolumeChart(chartRaw.rows);
+    // Per-worker expected interval (seconds) — used to detect stale data.
+    // If last run is older than 2× interval, flag as stale.
+    const WORKER_INTERVAL_SECONDS = {
+      alert: 60, bluesky: 300, x: 300, reddit: 600, rss: 900, digest: 1800
+    };
+    const isStale = (name, w) => {
+      if (!w) return true;
+      const expected = WORKER_INTERVAL_SECONDS[name];
+      if (!expected) return false;
+      const ageSec = Math.floor((Date.now() - new Date(w.started_at).getTime()) / 1000);
+      return ageSec > expected * 2;
+    };
+
     const healthChip = (name) => {
       const w = workerByName[name];
-      if (!w) return `<span class="muted">${name}: never run</span>`;
-      const dotColor = w.ok ? '#3a9c3a' : '#a82a2a';
+      if (!w) return `<div style="display:flex;align-items:center;gap:8px;font-size:12px;padding:6px 0"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#5b6573"></span><span style="color:#8b949e;font-weight:500;width:64px">${escapeHtml(name)}</span><span class="muted">never run</span></div>`;
+      const stale = isStale(name, w);
+      const dotColor = !w.ok ? '#a82a2a' : stale ? '#d8902f' : '#3a9c3a';
+      const staleLabel = stale ? ' · <strong style="color:#d8902f">STALE</strong>' : '';
       const summary = w.summary && typeof w.summary === 'object' ? w.summary : null;
       const summaryBits = summary ? Object.entries(summary).filter(([k]) => !k.includes('_details')).map(([k, v]) => `${k}: ${v}`).join(' · ') : '';
       return `<div style="display:flex;align-items:center;gap:8px;font-size:12px;padding:6px 0">
         <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${dotColor}"></span>
         <span style="color:#e6edf3;font-weight:500;width:64px">${escapeHtml(name)}</span>
-        <span class="muted">${ago(w.started_at)} · ${w.duration_ms || 0}ms${w.error ? ' · ERROR: ' + escapeHtml(w.error.slice(0, 80)) : ''}</span>
+        <span class="muted">${ago(w.started_at)} · ${w.duration_ms || 0}ms${staleLabel}${w.error ? ' · ERROR: ' + escapeHtml(w.error.slice(0, 80)) : ''}</span>
         ${summaryBits ? `<span class="muted" style="margin-left:auto">${escapeHtml(summaryBits)}</span>` : ''}
       </div>`;
     };

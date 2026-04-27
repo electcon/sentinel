@@ -132,19 +132,37 @@ function build(pool) {
       </tr>
     `).join('');
 
-    const workerRows = workers.rows.map(w => `
+    const WORKER_INTERVAL_SECONDS = { alert: 60, bluesky: 300, x: 300, reddit: 600, rss: 900, digest: 1800, cleanup: 3600 };
+    const isStale = (w) => {
+      const expected = WORKER_INTERVAL_SECONDS[w.worker_name];
+      if (!expected) return false;
+      const ageSec = Math.floor((Date.now() - new Date(w.started_at).getTime()) / 1000);
+      return ageSec > expected * 2;
+    };
+    const staleWorkers = workers.rows.filter(w => isStale(w));
+    const workerRows = workers.rows.map(w => {
+      const stale = isStale(w);
+      const status = !w.ok ? '<span class="pill err">err</span>' : stale ? '<span class="pill" style="background:#3d301a;color:#d8902f">stale</span>' : '<span class="pill ok">ok</span>';
+      return `
       <tr>
         <td><strong>${escapeHtml(w.worker_name)}</strong></td>
-        <td><span class="pill ${w.ok ? 'ok' : 'err'}">${w.ok ? 'ok' : 'err'}</span></td>
+        <td>${status}</td>
         <td class="muted">${ago(w.started_at)}</td>
         <td class="muted">${w.duration_ms || 0}ms</td>
         <td class="muted">${w.error ? escapeHtml(w.error.slice(0, 80)) : (w.summary ? escapeHtml(JSON.stringify(w.summary).slice(0, 200)) : '—')}</td>
       </tr>
-    `).join('');
+    `;
+    }).join('');
 
+    const staleBanner = staleWorkers.length
+      ? `<div style="background:#3d301a;border-left:3px solid #d8902f;padding:10px 14px;margin:14px 0;font-size:13px">
+           <strong style="color:#d8902f">⚠ Stale workers:</strong> ${staleWorkers.map(w => escapeHtml(w.worker_name)).join(', ')} —
+           last run is older than 2× the expected interval. Investigate via the Errors tab or Render logs.
+         </div>` : '';
     const body = `
       <h1>Sentinel — admin overview</h1>
       <div class="muted">${customers.rowCount} customer${customers.rowCount === 1 ? '' : 's'} · ${mentions24h.rows[0].n} mentions · ${threats24h.rows[0].n} threat events · ${errors24h.rows[0].n} worker errors (24h)</div>
+      ${staleBanner}
 
       <h2>Customers</h2>
       ${customers.rowCount ? `<table>
