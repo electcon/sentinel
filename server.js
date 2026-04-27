@@ -118,6 +118,18 @@ app.post('/api/_smoke/rss-run', requireSmokeToken, async (req, res) => {
   }
 });
 
+// Trigger one X (Twitter) ingest run.
+app.post('/api/_smoke/x-run', requireSmokeToken, async (req, res) => {
+  try {
+    const { runOnce } = require('./workers/x');
+    const log = (m) => console.log(m);
+    const summary = await runOnce({ pool, log });
+    res.json(summary);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Idempotent dev-customer seeder. POST to provision the test customer
 // and dev targets (Cinde Warmington, Eileen Laubacher, Charlie Crist).
 app.post('/api/_smoke/seed-dev', requireSmokeToken, async (req, res) => {
@@ -280,6 +292,7 @@ const SCHEDULES = [
   { name: 'bluesky', intervalMs:  5 * 60 * 1000,     startupDelayMs: 30 * 1000, run: () => require('./workers/bluesky').runOnce({ pool, log: scheduledLog('bluesky') }) },
   { name: 'reddit',  intervalMs: 10 * 60 * 1000,     startupDelayMs: 60 * 1000, run: () => require('./workers/reddit').runOnce({ pool, log: scheduledLog('reddit') }) },
   { name: 'rss',     intervalMs: 15 * 60 * 1000,     startupDelayMs: 90 * 1000, run: () => require('./workers/rss').runOnce({ pool, log: scheduledLog('rss') }) },
+  { name: 'x',       intervalMs:  5 * 60 * 1000,     startupDelayMs: 100 * 1000, run: () => require('./workers/x').runOnce({ pool, log: scheduledLog('x') }) },
   { name: 'digest',  intervalMs: 30 * 60 * 1000,     startupDelayMs: 120 * 1000, run: () => require('./workers/digest').runOnce({ pool, log: scheduledLog('digest') }) }
 ];
 
