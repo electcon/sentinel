@@ -594,19 +594,27 @@ function build(pool) {
   r.get('/admin/telegram-channels', gate, async (req, res) => {
     const q = await pool.query(`
       SELECT id, channel_id, category, label, notes, citation, est_subscribers,
-             active, last_run_at, last_post_count, last_error, created_at
+             active, last_run_at, last_post_count, last_error,
+             consecutive_empty_runs, auto_paused_at, auto_paused_reason,
+             created_at
       FROM monitored_channels
       WHERE source = 'telegram'
-      ORDER BY active DESC, channel_id ASC
+      ORDER BY active DESC, auto_paused_at DESC NULLS LAST, channel_id ASC
     `);
     const flash = req.query.ok ? `<div style="background:#1a4a1a;color:#7fff7f;padding:10px;margin-bottom:14px;border-radius:4px">${escapeHtml(req.query.ok)}</div>` : '';
     const errFlash = req.query.err ? `<div style="background:#5e0e16;color:#fff;padding:10px;margin-bottom:14px;border-radius:4px">${escapeHtml(req.query.err)}</div>` : '';
     const rows = q.rows.map(c => {
-      const status = c.active ? '<span class="pill ok">active</span>' : '<span class="pill" style="background:#3d301a;color:#d8902f">paused</span>';
+      const isAutoPaused = !c.active && !!c.auto_paused_at;
+      const status = c.active
+        ? '<span class="pill ok">active</span>'
+        : isAutoPaused
+          ? `<span class="pill" style="background:#5e0e16;color:#ff7f7f">auto-paused</span><div class="muted" style="font-size:10px;margin-top:2px">${escapeHtml(c.auto_paused_reason || 'stale')} · ${ago(c.auto_paused_at)}</div>`
+          : '<span class="pill" style="background:#3d301a;color:#d8902f">paused</span>';
       const lastRun = c.last_run_at ? `${ago(c.last_run_at)} · ${c.last_post_count || 0} posts` : 'never';
+      const consecutive = (c.consecutive_empty_runs || 0) > 0 && c.active ? `<div class="muted" style="font-size:10px;color:#d8902f;margin-top:2px">${c.consecutive_empty_runs} empty in a row</div>` : '';
       const errLine = c.last_error ? `<div class="muted" style="color:#ff7080;font-size:11px;margin-top:4px">⚠ ${escapeHtml(c.last_error.slice(0, 150))}</div>` : '';
       return `<tr>
-        <td><strong>${escapeHtml(c.channel_id)}</strong>${c.label ? `<div class="muted" style="font-size:11px">${escapeHtml(c.label)}</div>` : ''}${errLine}</td>
+        <td><strong>${escapeHtml(c.channel_id)}</strong>${c.label ? `<div class="muted" style="font-size:11px">${escapeHtml(c.label)}</div>` : ''}${consecutive}${errLine}</td>
         <td>${c.category ? `<span class="status-pill">${escapeHtml(c.category)}</span>` : '<span class="muted">—</span>'}</td>
         <td>${status}</td>
         <td class="muted">${lastRun}</td>
@@ -678,7 +686,16 @@ function build(pool) {
   });
 
   r.post('/admin/telegram-channels/:id/toggle', gate, express.urlencoded({ extended: false }), async (req, res) => {
-    await pool.query(`UPDATE monitored_channels SET active = NOT active WHERE id = $1 AND source = 'telegram'`, [req.params.id]);
+    // Resuming a channel (active flips to TRUE) also clears auto-pause
+    // counters so it doesn't immediately re-pause on the next tick.
+    await pool.query(`
+      UPDATE monitored_channels
+      SET active = NOT active,
+          consecutive_empty_runs = CASE WHEN NOT active THEN 0 ELSE consecutive_empty_runs END,
+          auto_paused_at = CASE WHEN NOT active THEN NULL ELSE auto_paused_at END,
+          auto_paused_reason = CASE WHEN NOT active THEN NULL ELSE auto_paused_reason END
+      WHERE id = $1 AND source = 'telegram'
+    `, [req.params.id]);
     res.redirect('/admin/telegram-channels?ok=Toggled');
   });
 

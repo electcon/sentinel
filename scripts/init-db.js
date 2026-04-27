@@ -192,6 +192,9 @@ async function initSchema(pool) {
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS monitored_channels_active ON monitored_channels (source, active) WHERE active = TRUE`);
+  await pool.query(`ALTER TABLE monitored_channels ADD COLUMN IF NOT EXISTS consecutive_empty_runs INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE monitored_channels ADD COLUMN IF NOT EXISTS auto_paused_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE monitored_channels ADD COLUMN IF NOT EXISTS auto_paused_reason TEXT`);
 
   // Per-tick worker run log. Lets the dashboard show "last ran X
   // minutes ago, processed N items, errored Y times." Old rows

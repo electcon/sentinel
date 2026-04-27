@@ -24,18 +24,52 @@ const SEED_CHANNELS = [];
 
 async function loadActiveChannels(pool) {
   const r = await pool.query(`
-    SELECT id, channel_id, category, label
+    SELECT id, channel_id, category, label, consecutive_empty_runs
     FROM monitored_channels
     WHERE source = 'telegram' AND active = TRUE
     ORDER BY channel_id
   `);
   if (r.rowCount > 0) return r.rows;
   // Fallback to hardcoded SEED_CHANNELS for backwards compat / first run.
-  return SEED_CHANNELS.map(c => ({ id: null, channel_id: c, category: null, label: null }));
+  return SEED_CHANNELS.map(c => ({ id: null, channel_id: c, category: null, label: null, consecutive_empty_runs: 0 }));
+}
+
+// On a 0-post fetch (or error) we increment consecutive_empty_runs.
+// Once it crosses STALE_THRESHOLD, flip active=false and stamp
+// auto_paused_at + reason so the admin UI can show "auto-paused" badge.
+async function markChannelEmpty(pool, channelRow, reason, log) {
+  if (!channelRow.id) return;
+  const newCount = (channelRow.consecutive_empty_runs || 0) + 1;
+  if (newCount >= STALE_THRESHOLD) {
+    await pool.query(`
+      UPDATE monitored_channels
+      SET consecutive_empty_runs = $2,
+          active = FALSE,
+          auto_paused_at = NOW(),
+          auto_paused_reason = $3
+      WHERE id = $1
+    `, [channelRow.id, newCount, reason.slice(0, 200)]);
+    log(`[telegram] auto-paused channel ${channelRow.channel_id} after ${newCount} consecutive ${reason}`);
+  } else {
+    await pool.query(`UPDATE monitored_channels SET consecutive_empty_runs = $2 WHERE id = $1`, [channelRow.id, newCount]);
+  }
+}
+
+async function markChannelHealthy(pool, channelRow) {
+  if (!channelRow.id) return;
+  if (!channelRow.consecutive_empty_runs) return;          // already 0
+  await pool.query(`
+    UPDATE monitored_channels
+    SET consecutive_empty_runs = 0,
+        auto_paused_at = NULL,
+        auto_paused_reason = NULL
+    WHERE id = $1
+  `, [channelRow.id]);
 }
 
 const MAX_POSTS_PER_CHANNEL = parseInt(process.env.TELEGRAM_MAX_POSTS, 10) || 20;
 const FETCH_GAP_MS = parseInt(process.env.TELEGRAM_FETCH_GAP_MS, 10) || 1500;
+const STALE_THRESHOLD = parseInt(process.env.TELEGRAM_STALE_THRESHOLD, 10) || 5;
 
 async function runOnce({ pool, log = console.log }) {
   const groups = await loadActiveTargets(pool);
@@ -68,12 +102,18 @@ async function runOnce({ pool, log = console.log }) {
       if (ch.id) {
         await pool.query('UPDATE monitored_channels SET last_run_at = NOW(), last_post_count = $2, last_error = NULL WHERE id = $1', [ch.id, posts.length]).catch(() => {});
       }
+      if (posts.length === 0) {
+        await markChannelEmpty(pool, ch, 'empty_runs', log).catch(() => {});
+      } else {
+        await markChannelHealthy(pool, ch).catch(() => {});
+      }
     } catch (e) {
       errors++;
       errorDetails.push({ channel, error: e.message.slice(0, 200) });
       log(`[telegram] channel ${channel} failed: ${e.message}`);
       if (ch.id) {
         await pool.query('UPDATE monitored_channels SET last_run_at = NOW(), last_error = $2 WHERE id = $1', [ch.id, e.message.slice(0, 500)]).catch(() => {});
+        await markChannelEmpty(pool, ch, 'fetch_errors', log).catch(() => {});
       }
       // Polite gap even on failure — t.me throttles aggressive callers
       await new Promise(r => setTimeout(r, FETCH_GAP_MS));
