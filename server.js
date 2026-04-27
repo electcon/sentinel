@@ -29,6 +29,27 @@ const pool = new Pool({
 });
 
 const app = express();
+
+// Security headers — applied to every response. CSP is strict because
+// our HTML pages don't load any external scripts; if the dashboard
+// adds a chart library later, relax these accordingly.
+app.use((req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.set('X-Frame-Options', 'DENY');
+  res.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  res.set('Content-Security-Policy',
+    "default-src 'self'; " +
+    "script-src 'self'; " +
+    "style-src 'self' 'unsafe-inline'; " +
+    "img-src 'self' data:; " +
+    "connect-src 'self'; " +
+    "form-action 'self'; " +
+    "frame-ancestors 'none'; " +
+    "base-uri 'self'");
+  next();
+});
+
 app.use(express.json({ limit: '1mb' }));
 
 // ── Health (Render uses this for health checks) ─────────────────────
@@ -345,7 +366,13 @@ const SCHEDULES = [
   { name: 'reddit',  intervalMs: 10 * 60 * 1000,     startupDelayMs: 60 * 1000, run: () => require('./workers/reddit').runOnce({ pool, log: scheduledLog('reddit') }) },
   { name: 'rss',     intervalMs: 15 * 60 * 1000,     startupDelayMs: 90 * 1000, run: () => require('./workers/rss').runOnce({ pool, log: scheduledLog('rss') }) },
   { name: 'x',       intervalMs:  5 * 60 * 1000,     startupDelayMs: 100 * 1000, run: () => require('./workers/x').runOnce({ pool, log: scheduledLog('x') }) },
-  { name: 'digest',  intervalMs: 30 * 60 * 1000,     startupDelayMs: 120 * 1000, run: () => require('./workers/digest').runOnce({ pool, log: scheduledLog('digest') }) }
+  { name: 'digest',  intervalMs: 30 * 60 * 1000,     startupDelayMs: 120 * 1000, run: () => require('./workers/digest').runOnce({ pool, log: scheduledLog('digest') }) },
+  { name: 'cleanup', intervalMs: 60 * 60 * 1000,     startupDelayMs: 180 * 1000, run: async () => {
+      // Prune worker_runs > 7d so the table doesn't grow unbounded.
+      const r = await pool.query(`DELETE FROM worker_runs WHERE started_at < NOW() - INTERVAL '7 days'`);
+      return { deleted: r.rowCount };
+    }
+  }
 ];
 
 function scheduledLog(name) {

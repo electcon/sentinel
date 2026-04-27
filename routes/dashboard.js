@@ -30,6 +30,39 @@ function escapeHtml(s) {
     .replace(/'/g, '&#39;');
 }
 
+// Per-IP login rate limit. In-memory counter — fine for single dyno.
+// 10 failed attempts per IP per 10 minutes locks out for 30 min.
+const _loginAttempts = new Map();
+const LOCKOUT_THRESHOLD = 10;
+const LOCKOUT_WINDOW_MS = 10 * 60 * 1000;
+const LOCKOUT_DURATION_MS = 30 * 60 * 1000;
+
+function loginRateLimit(req, res, next) {
+  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+  if (!ip) return next();
+  const now = Date.now();
+  let entry = _loginAttempts.get(ip);
+  if (!entry) { entry = { count: 0, firstAt: now, lockedUntil: 0 }; _loginAttempts.set(ip, entry); }
+  if (entry.lockedUntil > now) {
+    return res.status(429).send('Too many login attempts. Try again in ~30 minutes.');
+  }
+  if (now - entry.firstAt > LOCKOUT_WINDOW_MS) { entry.count = 0; entry.firstAt = now; }
+  entry.count++;
+  if (entry.count > LOCKOUT_THRESHOLD) {
+    entry.lockedUntil = now + LOCKOUT_DURATION_MS;
+    return res.status(429).send('Too many login attempts. Try again in ~30 minutes.');
+  }
+  next();
+}
+
+// Periodically prune the rate-limit map so it doesn't grow unbounded.
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, e] of _loginAttempts.entries()) {
+    if (e.lockedUntil < now && now - e.firstAt > LOCKOUT_WINDOW_MS) _loginAttempts.delete(ip);
+  }
+}, 5 * 60 * 1000).unref?.();
+
 const TIER_LABELS = {
   4: 'Tier 4 — imminent violence',
   3: 'Tier 3 — credible threat / doxxing',
@@ -175,7 +208,7 @@ function build(pool) {
     res.send(layout({ title: 'Log in', customer: null, body, active: 'login' }));
   });
 
-  r.post('/login', express.urlencoded({ extended: false }), async (req, res) => {
+  r.post('/login', express.urlencoded({ extended: false }), loginRateLimit, async (req, res) => {
     const email = (req.body.email || '').toLowerCase().trim();
     const password = req.body.password || '';
     const next = req.body.next || '/dashboard';
