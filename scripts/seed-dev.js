@@ -55,22 +55,23 @@ async function main() {
     ssl: useSSL ? { rejectUnauthorized: false } : false
   });
 
-  // Upsert customer.
-  const cust = await pool.query(`
-    INSERT INTO customers (name, contact_email, alert_email, digest_email, status)
-    VALUES ($1, $2, $3, $4, $5)
-    ON CONFLICT DO NOTHING
-    RETURNING id
-  `, [DEV_CUSTOMER.name, DEV_CUSTOMER.contact_email, DEV_CUSTOMER.alert_email, DEV_CUSTOMER.digest_email, DEV_CUSTOMER.status]);
-
+  // Find-or-create the dev customer. We don't use ON CONFLICT here
+  // because there's no unique constraint on customers.name in v1
+  // (real customers can legitimately share names). The dev customer
+  // is identified by a name string we control.
+  const existing = await pool.query('SELECT id FROM customers WHERE name = $1 LIMIT 1', [DEV_CUSTOMER.name]);
   let customerId;
-  if (cust.rowCount > 0) {
-    customerId = cust.rows[0].id;
-    console.log('[seed] customer created:', customerId);
-  } else {
-    const existing = await pool.query('SELECT id FROM customers WHERE name = $1 LIMIT 1', [DEV_CUSTOMER.name]);
+  if (existing.rowCount > 0) {
     customerId = existing.rows[0].id;
     console.log('[seed] customer exists:', customerId);
+  } else {
+    const ins = await pool.query(`
+      INSERT INTO customers (name, contact_email, alert_email, digest_email, status)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING id
+    `, [DEV_CUSTOMER.name, DEV_CUSTOMER.contact_email, DEV_CUSTOMER.alert_email, DEV_CUSTOMER.digest_email, DEV_CUSTOMER.status]);
+    customerId = ins.rows[0].id;
+    console.log('[seed] customer created:', customerId);
   }
 
   // Upsert each target. There's no natural unique key on (customer_id, name)

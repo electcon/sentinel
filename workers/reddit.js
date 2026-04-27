@@ -32,15 +32,21 @@ const LIMIT_PER_QUERY = parseInt(process.env.REDDIT_LIMIT_PER_QUERY, 10) || 25;
 const MAX_QUERIES_PER_TARGET = parseInt(process.env.REDDIT_MAX_QUERIES_PER_TARGET, 10) || 3;
 
 function buildQueriesForTarget(target) {
-  // Reddit search supports quoted phrases. We always quote the canonical
-  // name to avoid spurious matches on common-word fragments. Aliases are
-  // taken in order, capped by MAX_QUERIES_PER_TARGET total queries.
-  const candidates = [target.name, ...(target.search_terms || []), ...(target.aliases || [])]
+  // Reddit search supports quoted phrases. We use ONLY the canonical
+  // full name plus explicit `search_terms`. Aliases (often bare
+  // surnames or first names) are deliberately excluded from search
+  // queries because single-word aliases produce massive false-positive
+  // volume (e.g. "Crist" hits Catalan religious text + unrelated
+  // comedians). Aliases still apply at body-match time via
+  // lib/match.matchTargets, where we're already inside content that
+  // mentioned a stronger term.
+  const candidates = [target.name, ...(target.search_terms || [])]
     .filter(Boolean)
-    .filter(s => String(s).trim().length >= 3);
+    .map(s => String(s).trim())
+    .filter(s => s.length >= 5 && /\s/.test(s));   // multi-word only
   const queries = [];
   for (const c of candidates) {
-    const q = `"${String(c).replace(/"/g, '')}"`;
+    const q = `"${c.replace(/"/g, '')}"`;
     if (!queries.includes(q)) queries.push(q);
     if (queries.length >= MAX_QUERIES_PER_TARGET) break;
   }
