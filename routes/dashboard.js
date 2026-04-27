@@ -47,9 +47,12 @@ const STATUS_OPTIONS = [
   { value: 'dismissed',           label: 'dismissed' }
 ];
 
-function layout({ title, customer, body, active }) {
+function layout({ title, customer, body, active, flash }) {
   const navLink = (href, label, key) =>
     `<a href="${href}" class="${active === key ? 'active' : ''}">${escapeHtml(label)}</a>`;
+  const flashBanner = flash
+    ? `<div style="background:${flash.kind === 'err' ? '#5e0e16' : '#1a4a1a'};color:#fff;padding:10px 16px;text-align:center;font-size:14px">${escapeHtml(flash.text)}</div>`
+    : '';
   return `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -107,12 +110,14 @@ ${customer ? `
     ${navLink('/dashboard', 'overview', 'overview')}
     ${navLink('/dashboard/threats', 'threats', 'threats')}
     ${navLink('/dashboard/mentions', 'mentions', 'mentions')}
+    ${navLink('/dashboard/settings', 'settings', 'settings')}
   </div>
   <div class="right">
     ${escapeHtml(customer.name)} ·
     <a href="/logout">log out</a>
   </div>
 </div>` : ''}
+${flashBanner}
 <div class="container">
 ${body}
 </div>
@@ -594,7 +599,207 @@ function build(pool) {
     res.send(layout({ title: 'Mention', customer: req.customer, body, active: 'mentions' }));
   });
 
+  // ── Settings: targets + emails + password ─────────────────────────
+  r.get('/dashboard/settings', auth, async (req, res) => {
+    const targets = await pool.query(`
+      SELECT id, kind, name, aliases, search_terms FROM targets
+      WHERE customer_id = $1 ORDER BY kind, name
+    `, [req.customer.id]);
+
+    const targetRows = targets.rows.map(t => `
+      <tr>
+        <td><span class="status-pill">${escapeHtml(t.kind || 'candidate')}</span></td>
+        <td><strong>${escapeHtml(t.name)}</strong></td>
+        <td>${escapeHtml((Array.isArray(t.aliases) ? t.aliases : []).join(', ') || '—')}</td>
+        <td>${escapeHtml((Array.isArray(t.search_terms) ? t.search_terms : []).join(', ') || '—')}</td>
+        <td><a href="/dashboard/targets/${t.id}">edit</a></td>
+        <td>
+          <form method="POST" action="/dashboard/targets/${t.id}/delete" onsubmit="return confirm('Delete target ${escapeHtml(t.name)}? This stops monitoring it but does not delete past mentions.');" style="display:inline">
+            <button type="submit" class="danger" style="padding:4px 8px;font-size:12px">delete</button>
+          </form>
+        </td>
+      </tr>
+    `).join('');
+
+    const flash = req.query.ok ? { kind: 'ok', text: req.query.ok } : (req.query.err ? { kind: 'err', text: req.query.err } : null);
+
+    const body = `
+      <h1>Settings</h1>
+      <div class="muted">${escapeHtml(req.customer.name)}</div>
+
+      <h2>Monitoring targets</h2>
+      ${targets.rowCount ? `<table>
+        <thead><tr><th>Kind</th><th>Name</th><th>Aliases</th><th>Search terms</th><th></th><th></th></tr></thead>
+        <tbody>${targetRows}</tbody>
+      </table>` : '<div class="empty">No targets yet.</div>'}
+      <div style="margin-top:14px">
+        <a href="/dashboard/targets/new"><button>+ Add target</button></a>
+      </div>
+
+      <h2>Alert + digest emails</h2>
+      <form method="POST" action="/dashboard/settings/emails">
+        <div class="field">
+          <label for="contact_email">Contact email (login + general)</label>
+          <input id="contact_email" name="contact_email" type="email" value="${escapeHtml(req.customer.contact_email || '')}" required>
+        </div>
+        <div class="field">
+          <label for="alert_email">Tier 3+ alert email (real-time)</label>
+          <input id="alert_email" name="alert_email" type="email" value="${escapeHtml(req.customer.alert_email || '')}" required>
+        </div>
+        <div class="field">
+          <label for="digest_email">Daily digest email (7am UTC)</label>
+          <input id="digest_email" name="digest_email" type="email" value="${escapeHtml(req.customer.digest_email || '')}" required>
+        </div>
+        <button type="submit">Save</button>
+      </form>
+
+      <h2>Change password</h2>
+      <form method="POST" action="/dashboard/settings/password">
+        <div class="field">
+          <label for="current_password">Current password</label>
+          <input id="current_password" name="current_password" type="password" required>
+        </div>
+        <div class="field">
+          <label for="new_password">New password (≥ 8 chars)</label>
+          <input id="new_password" name="new_password" type="password" required minlength="8">
+        </div>
+        <div class="field">
+          <label for="confirm_password">Confirm new password</label>
+          <input id="confirm_password" name="confirm_password" type="password" required minlength="8">
+        </div>
+        <button type="submit">Change password</button>
+      </form>
+    `;
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(layout({ title: 'Settings', customer: req.customer, body, active: 'settings', flash }));
+  });
+
+  r.post('/dashboard/settings/emails', auth, express.urlencoded({ extended: false }), async (req, res) => {
+    const c = req.body.contact_email?.trim();
+    const a = req.body.alert_email?.trim();
+    const d = req.body.digest_email?.trim();
+    if (!c || !a || !d) return res.redirect('/dashboard/settings?err=All+fields+required');
+    await pool.query(`UPDATE customers SET contact_email = $1, alert_email = $2, digest_email = $3 WHERE id = $4`,
+      [c, a, d, req.customer.id]);
+    res.redirect('/dashboard/settings?ok=Emails+updated');
+  });
+
+  r.post('/dashboard/settings/password', auth, express.urlencoded({ extended: false }), async (req, res) => {
+    const cur = req.body.current_password || '';
+    const next = req.body.new_password || '';
+    const confirm = req.body.confirm_password || '';
+    if (!cur || !next || next !== confirm) return res.redirect('/dashboard/settings?err=Passwords+do+not+match');
+    if (next.length < 8) return res.redirect('/dashboard/settings?err=Password+must+be+%E2%89%A5+8+chars');
+    const q = await pool.query('SELECT password_hash FROM customers WHERE id = $1', [req.customer.id]);
+    const ok = await verifyPassword(cur, q.rows[0]?.password_hash || '');
+    if (!ok) return res.redirect('/dashboard/settings?err=Current+password+wrong');
+    const hash = await hashPassword(next);
+    await pool.query('UPDATE customers SET password_hash = $1 WHERE id = $2', [hash, req.customer.id]);
+    res.redirect('/dashboard/settings?ok=Password+changed');
+  });
+
+  // ── Target add/edit/delete ─────────────────────────────────────────
+  r.get('/dashboard/targets/new', auth, (req, res) => {
+    const body = renderTargetForm({ kind: 'candidate', name: '', aliases: [], search_terms: [] }, '/dashboard/targets/new', 'New target');
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(layout({ title: 'New target', customer: req.customer, body, active: 'settings' }));
+  });
+
+  r.post('/dashboard/targets/new', auth, express.urlencoded({ extended: false }), async (req, res) => {
+    const t = parseTargetForm(req.body);
+    if (!t.name) return res.redirect('/dashboard/settings?err=Target+name+required');
+    await pool.query(`
+      INSERT INTO targets (customer_id, kind, name, aliases, search_terms)
+      VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
+      ON CONFLICT (customer_id, name) DO UPDATE
+      SET kind = EXCLUDED.kind, aliases = EXCLUDED.aliases, search_terms = EXCLUDED.search_terms
+    `, [req.customer.id, t.kind, t.name, JSON.stringify(t.aliases), JSON.stringify(t.search_terms)]);
+    res.redirect('/dashboard/settings?ok=Target+saved');
+  });
+
+  r.get('/dashboard/targets/:id', auth, async (req, res) => {
+    const q = await pool.query(`SELECT id, kind, name, aliases, search_terms FROM targets WHERE id = $1 AND customer_id = $2`, [req.params.id, req.customer.id]);
+    if (!q.rowCount) return res.status(404).send('not found');
+    const t = q.rows[0];
+    const body = renderTargetForm({
+      kind: t.kind || 'candidate',
+      name: t.name,
+      aliases: Array.isArray(t.aliases) ? t.aliases : [],
+      search_terms: Array.isArray(t.search_terms) ? t.search_terms : []
+    }, `/dashboard/targets/${t.id}`, 'Edit target');
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(layout({ title: 'Edit target', customer: req.customer, body, active: 'settings' }));
+  });
+
+  r.post('/dashboard/targets/:id', auth, express.urlencoded({ extended: false }), async (req, res) => {
+    const t = parseTargetForm(req.body);
+    if (!t.name) return res.redirect(`/dashboard/targets/${req.params.id}?err=Target+name+required`);
+    await pool.query(`
+      UPDATE targets SET kind = $1, name = $2, aliases = $3::jsonb, search_terms = $4::jsonb
+      WHERE id = $5 AND customer_id = $6
+    `, [t.kind, t.name, JSON.stringify(t.aliases), JSON.stringify(t.search_terms), req.params.id, req.customer.id]);
+    res.redirect('/dashboard/settings?ok=Target+saved');
+  });
+
+  r.post('/dashboard/targets/:id/delete', auth, express.urlencoded({ extended: false }), async (req, res) => {
+    // Soft-delete via status would be nicer; for v1 hard-delete is fine,
+    // but only if no mentions reference it (otherwise FK breaks).
+    // The mentions FK has no ON DELETE, so we set target_id to NULL on
+    // those mentions before dropping the target row.
+    await pool.query('UPDATE mentions SET target_id = NULL WHERE target_id = $1 AND customer_id = $2', [req.params.id, req.customer.id]);
+    await pool.query('UPDATE threat_events SET target_id = NULL WHERE target_id = $1 AND customer_id = $2', [req.params.id, req.customer.id]);
+    await pool.query('DELETE FROM targets WHERE id = $1 AND customer_id = $2', [req.params.id, req.customer.id]);
+    res.redirect('/dashboard/settings?ok=Target+deleted');
+  });
+
   return r;
+}
+
+function parseTargetForm(body) {
+  const kindRaw = String(body.kind || '').trim();
+  const kind = ['candidate', 'family', 'staff', 'surrogate'].includes(kindRaw) ? kindRaw : 'candidate';
+  return {
+    kind,
+    name: String(body.name || '').trim(),
+    aliases: csvSplit(body.aliases),
+    search_terms: csvSplit(body.search_terms)
+  };
+}
+
+function csvSplit(s) {
+  return String(s || '')
+    .split(/[\n,]/)
+    .map(x => x.trim())
+    .filter(Boolean);
+}
+
+function renderTargetForm(t, action, title) {
+  return `
+    <a href="/dashboard/settings" class="muted">← settings</a>
+    <h1 style="margin-top:14px">${escapeHtml(title)}</h1>
+    <form method="POST" action="${escapeHtml(action)}">
+      <div class="field">
+        <label for="kind">Kind</label>
+        <select id="kind" name="kind" style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px 12px;border-radius:4px;font-size:14px;width:100%">
+          ${['candidate','family','staff','surrogate'].map(k => `<option value="${k}" ${t.kind === k ? 'selected' : ''}>${k}</option>`).join('')}
+        </select>
+      </div>
+      <div class="field">
+        <label for="name">Full name</label>
+        <input id="name" name="name" type="text" value="${escapeHtml(t.name)}" required placeholder="Jane Doe">
+      </div>
+      <div class="field">
+        <label for="aliases">Aliases (comma- or newline-separated; matched against post body, NOT used for search queries)</label>
+        <textarea id="aliases" name="aliases" rows="2" style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px 12px;border-radius:4px;font-size:14px;width:100%;font-family:inherit">${escapeHtml((t.aliases || []).join(', '))}</textarea>
+      </div>
+      <div class="field">
+        <label for="search_terms">Search terms (multi-word phrases used to query Reddit / Bluesky / Google News / X)</label>
+        <textarea id="search_terms" name="search_terms" rows="2" style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px 12px;border-radius:4px;font-size:14px;width:100%;font-family:inherit">${escapeHtml((t.search_terms || []).join(', '))}</textarea>
+      </div>
+      <button type="submit">Save</button>
+      <a href="/dashboard/settings" style="margin-left:10px"><button type="button" class="secondary">Cancel</button></a>
+    </form>
+  `;
 }
 
 module.exports = build;
