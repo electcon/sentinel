@@ -80,9 +80,10 @@ const STATUS_OPTIONS = [
   { value: 'dismissed',           label: 'dismissed' }
 ];
 
-function layout({ title, customer, body, active, flash }) {
-  const navLink = (href, label, key) =>
-    `<a href="${href}" class="${active === key ? 'active' : ''}">${escapeHtml(label)}</a>`;
+function layout({ title, customer, body, active, flash, reviewQueueCount }) {
+  const reviewCount = reviewQueueCount != null ? reviewQueueCount : (customer && customer.reviewQueueCount) || 0;
+  const navLink = (href, label, key, badge) =>
+    `<a href="${href}" class="${active === key ? 'active' : ''}">${escapeHtml(label)}${badge ? ` <span style="background:#a07f1a;color:#fff;padding:1px 6px;border-radius:8px;font-size:11px;font-weight:600">${badge}</span>` : ''}</a>`;
   const flashBanner = flash
     ? `<div style="background:${flash.kind === 'err' ? '#5e0e16' : '#1a4a1a'};color:#fff;padding:10px 16px;text-align:center;font-size:14px">${escapeHtml(flash.text)}</div>`
     : '';
@@ -142,6 +143,7 @@ ${customer ? `
   <div class="links">
     ${navLink('/dashboard', 'overview', 'overview')}
     ${navLink('/dashboard/threats', 'threats', 'threats')}
+    ${navLink('/dashboard/review-queue', 'review queue', 'review-queue', reviewCount > 0 ? reviewCount : null)}
     ${navLink('/dashboard/mentions', 'mentions', 'mentions')}
     ${navLink('/dashboard/settings', 'settings', 'settings')}
   </div>
@@ -177,6 +179,18 @@ function fmtTime(d) {
 function build(pool) {
   const r = express.Router();
   const auth = requireCustomerAuth(pool);
+
+  // After auth, attach the pending-review count to req.customer so
+  // every layout() call shows the nav badge. Single small query per
+  // render — index `mentions_review_pending` makes it cheap.
+  async function withReviewCount(req, res, next) {
+    try {
+      const q = await pool.query(`SELECT COUNT(*)::int AS n FROM mentions WHERE customer_id = $1 AND review_status = 'pending'`, [req.customer.id]);
+      req.customer.reviewQueueCount = q.rows[0].n;
+    } catch (_) { req.customer.reviewQueueCount = 0; }
+    next();
+  }
+  const authed = [auth, withReviewCount];
 
   // ── Login / logout ─────────────────────────────────────────────────
   r.get('/login', (req, res) => {
@@ -243,7 +257,7 @@ function build(pool) {
   });
 
   // ── Dashboard overview ─────────────────────────────────────────────
-  r.get('/dashboard', auth, async (req, res) => {
+  r.get('/dashboard', authed, async (req, res) => {
     const customerId = req.customer.id;
 
     // Per-worker most-recent run, for the system-health panel.
@@ -389,7 +403,7 @@ function build(pool) {
   });
 
   // ── Threat queue (full list, all statuses) ─────────────────────────
-  r.get('/dashboard/threats', auth, async (req, res) => {
+  r.get('/dashboard/threats', authed, async (req, res) => {
     const status = req.query.status || 'all';
     const valid = STATUS_OPTIONS.map(s => s.value).concat(['all']);
     const useStatus = valid.includes(status) ? status : 'all';
@@ -439,7 +453,7 @@ function build(pool) {
   });
 
   // ── Threat detail + status update ──────────────────────────────────
-  r.get('/dashboard/threats/:id', auth, async (req, res) => {
+  r.get('/dashboard/threats/:id', authed, async (req, res) => {
     const q = await pool.query(`
       SELECT te.*, m.body_excerpt, m.source, m.source_url, m.s3_key, m.posted_at, m.author_handle, m.rationale,
              t.name AS target_name, t.kind AS target_kind
@@ -497,7 +511,7 @@ function build(pool) {
     res.send(layout({ title: 'Threat', customer: req.customer, body, active: 'threats' }));
   });
 
-  r.post('/dashboard/threats/:id/action', auth, express.urlencoded({ extended: false }), async (req, res) => {
+  r.post('/dashboard/threats/:id/action', authed, express.urlencoded({ extended: false }), async (req, res) => {
     const newStatus = req.body.status;
     const note = (req.body.note || '').trim().slice(0, 1000);
     const valid = STATUS_OPTIONS.map(s => s.value);
@@ -517,7 +531,7 @@ function build(pool) {
   });
 
   // ── Mentions list (paginated, searchable) ──────────────────────────
-  r.get('/dashboard/mentions', auth, async (req, res) => {
+  r.get('/dashboard/mentions', authed, async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
     const tierFilter = req.query.tier;
     const sourceFilter = req.query.source;
@@ -608,7 +622,7 @@ function build(pool) {
   });
 
   // ── CSV export for mentions ────────────────────────────────────────
-  r.get('/dashboard/mentions.csv', auth, async (req, res) => {
+  r.get('/dashboard/mentions.csv', authed, async (req, res) => {
     const tierFilter = req.query.tier;
     const sourceFilter = req.query.source;
     const search = (req.query.q || '').trim().slice(0, 200);
@@ -647,7 +661,7 @@ function build(pool) {
     res.end();
   });
 
-  r.get('/dashboard/threats.csv', auth, async (req, res) => {
+  r.get('/dashboard/threats.csv', authed, async (req, res) => {
     const q = await pool.query(`
       SELECT te.id, te.tier, te.status, te.created_at, te.alerted_at, te.resolved_at, te.notes,
              m.source, m.source_url, m.author_handle, m.posted_at, m.body_excerpt,
@@ -670,7 +684,7 @@ function build(pool) {
   });
 
   // ── Targets bulk import ────────────────────────────────────────────
-  r.post('/dashboard/targets/bulk-import', auth, express.urlencoded({ extended: false, limit: '256kb' }), async (req, res) => {
+  r.post('/dashboard/targets/bulk-import', authed, express.urlencoded({ extended: false, limit: '256kb' }), async (req, res) => {
     const text = (req.body.bulk || '').trim();
     if (!text) return res.redirect('/dashboard/settings?err=No+input');
 
@@ -712,7 +726,7 @@ function build(pool) {
   });
 
   // ── Mention detail ─────────────────────────────────────────────────
-  r.get('/dashboard/mentions/:id', auth, async (req, res) => {
+  r.get('/dashboard/mentions/:id', authed, async (req, res) => {
     const q = await pool.query(`
       SELECT m.*, t.name AS target_name, t.kind AS target_kind
       FROM mentions m
@@ -751,8 +765,163 @@ function build(pool) {
     res.send(layout({ title: 'Mention', customer: req.customer, body, active: 'mentions' }));
   });
 
+  // ── Tier-2 review queue ───────────────────────────────────────────
+  // Tier-2 mentions land here (per THREAT_TAXONOMY: hostile rhetoric
+  // without specific threats). Reviewer dismisses, escalates to T3,
+  // or files under "ongoing campaign" for trend tracking.
+  r.get('/dashboard/review-queue', authed, async (req, res) => {
+    const filter = req.query.filter || 'pending';
+    const valid = ['pending', 'dismissed', 'escalated', 'ongoing_campaign', 'all'];
+    const useFilter = valid.includes(filter) ? filter : 'pending';
+    const args = [req.customer.id];
+    let where = '';
+    if (useFilter !== 'all') {
+      args.push(useFilter);
+      where = `AND m.review_status = $${args.length}`;
+    } else {
+      where = `AND m.review_status IS NOT NULL`;
+    }
+    const q = await pool.query(`
+      SELECT m.id, m.threat_tier, m.source, m.source_url, m.posted_at, m.body_excerpt,
+             m.rationale, m.review_status, m.reviewed_at, m.reviewed_by,
+             t.name AS target_name
+      FROM mentions m
+      LEFT JOIN targets t ON t.id = m.target_id
+      WHERE m.customer_id = $1 ${where}
+      ORDER BY m.ingested_at ASC
+      LIMIT 200
+    `, args);
+
+    const filterPill = (val, label) =>
+      `<a href="/dashboard/review-queue?filter=${val}" class="pill" style="background:${useFilter === val ? '#a07f1a' : '#1c2330'};color:${useFilter === val ? '#fff' : '#8b949e'};margin-right:6px">${escapeHtml(label)}</a>`;
+
+    const rows = q.rows.map(m => `
+      <tr>
+        <td>${tierPill(m.threat_tier)}</td>
+        <td>${escapeHtml(m.target_name || '—')}</td>
+        <td>${escapeHtml(m.source)}</td>
+        <td>${escapeHtml((m.body_excerpt || '').slice(0, 160))}</td>
+        <td class="muted">${fmtTime(m.posted_at)}</td>
+        <td><span class="status-pill">${escapeHtml(m.review_status || '—')}</span></td>
+        <td><a href="/dashboard/review-queue/${m.id}">open</a></td>
+      </tr>
+    `).join('');
+
+    const body = `
+      <h1>Review queue</h1>
+      <div class="muted">Tier-2 mentions per the classifier. Reviewer dismisses, escalates to T3 (real-time alert), or files under ongoing-campaign for trend tracking.</div>
+      <div style="margin:18px 0">
+        ${filterPill('pending', 'pending')}
+        ${filterPill('escalated', 'escalated')}
+        ${filterPill('dismissed', 'dismissed')}
+        ${filterPill('ongoing_campaign', 'ongoing campaign')}
+        ${filterPill('all', 'all')}
+      </div>
+      <div class="muted" style="font-size:12px">${q.rowCount} mention${q.rowCount === 1 ? '' : 's'}</div>
+      ${q.rowCount ? `<table style="margin-top:8px">
+        <thead><tr><th>Tier</th><th>Target</th><th>Source</th><th>Excerpt</th><th>Posted</th><th>Status</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>` : '<div class="empty">Nothing in this filter.</div>'}
+    `;
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(layout({ title: 'Review queue', customer: req.customer, body, active: 'review-queue' }));
+  });
+
+  r.get('/dashboard/review-queue/:id', authed, async (req, res) => {
+    const q = await pool.query(`
+      SELECT m.*, t.name AS target_name, t.kind AS target_kind
+      FROM mentions m
+      LEFT JOIN targets t ON t.id = m.target_id
+      WHERE m.id = $1 AND m.customer_id = $2
+      LIMIT 1
+    `, [req.params.id, req.customer.id]);
+    if (!q.rowCount) return res.status(404).send('not found');
+    const m = q.rows[0];
+
+    const isPending = m.review_status === 'pending';
+    const actions = isPending ? `
+      <form method="POST" action="/dashboard/review-queue/${m.id}/action">
+        <div class="field">
+          <label for="note">Note (optional — adds to audit trail)</label>
+          <textarea id="note" name="note" rows="2" style="width:100%;background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;font-family:inherit;font-size:14px" placeholder="Why this disposition?"></textarea>
+        </div>
+        <div class="actions">
+          <button type="submit" name="action" value="dismissed" class="secondary">Dismiss (not actionable)</button>
+          <button type="submit" name="action" value="ongoing_campaign" class="secondary">File under ongoing campaign</button>
+          <button type="submit" name="action" value="escalated" class="danger">Escalate to Tier 3 (real-time alert)</button>
+        </div>
+      </form>
+    ` : `<div class="muted">Already reviewed: <strong>${escapeHtml(m.review_status)}</strong>${m.reviewed_at ? ` at ${fmtTime(m.reviewed_at)}` : ''}${m.reviewed_by ? ` by ${escapeHtml(m.reviewed_by)}` : ''}.</div>`;
+
+    const body = `
+      <a href="/dashboard/review-queue" class="muted">← review queue</a>
+      <h1 style="margin-top:14px">${tierPill(m.threat_tier)} ${escapeHtml(m.target_name || '—')}</h1>
+      <div class="muted">Tier 2 — hostile rhetoric · status: ${escapeHtml(m.review_status || '—')}</div>
+
+      <div class="card" style="margin-top:20px">
+        <div class="key-value">
+          <div>target</div><div>${escapeHtml(m.target_name || '—')} (${escapeHtml(m.target_kind || '—')})</div>
+          <div>source</div><div>${escapeHtml(m.source)}</div>
+          <div>author</div><div>${escapeHtml(m.author_handle || '—')}</div>
+          <div>posted</div><div>${fmtTime(m.posted_at)}</div>
+          <div>ingested</div><div>${fmtTime(m.ingested_at)}</div>
+          <div>url</div><div><a href="${escapeHtml(m.source_url)}" target="_blank" rel="noopener">${escapeHtml(m.source_url || '—')}</a></div>
+          <div>evidence</div><div><code>${escapeHtml(m.s3_key || '—')}</code></div>
+        </div>
+      </div>
+
+      <h2>Content</h2>
+      <div class="body-excerpt">${escapeHtml(m.body_excerpt || '')}</div>
+
+      <h2>Classifier rationale</h2>
+      <div class="body-excerpt">${escapeHtml(m.rationale || '—')}</div>
+
+      <h2>Action</h2>
+      ${actions}
+
+      ${m.review_notes ? `<h2>Audit trail</h2>
+        <div class="body-excerpt" style="font-size:13px">${escapeHtml(m.review_notes)}</div>` : ''}
+    `;
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(layout({ title: 'Review', customer: req.customer, body, active: 'review-queue' }));
+  });
+
+  r.post('/dashboard/review-queue/:id/action', authed, express.urlencoded({ extended: false }), async (req, res) => {
+    const action = req.body.action;
+    const note = (req.body.note || '').trim().slice(0, 1000);
+    const valid = ['dismissed', 'escalated', 'ongoing_campaign'];
+    if (!valid.includes(action)) return res.status(400).send('bad action');
+    const stamp = new Date().toISOString().slice(0, 19).replace('T', ' ') + ' UTC';
+    const actor = req.customer.name || req.customer.id;
+    const entry = `[${stamp}] [${actor}] → ${action}${note ? ' — ' + note : ''}`;
+
+    // Update mention review state.
+    await pool.query(`
+      UPDATE mentions
+      SET review_status = $2,
+          reviewed_at = NOW(),
+          reviewed_by = $3,
+          review_notes = CASE WHEN review_notes IS NULL OR review_notes = '' THEN $4 ELSE review_notes || E'\\n' || $4 END
+      WHERE id = $1 AND customer_id = $5
+    `, [req.params.id, action, actor, entry, req.customer.id]);
+
+    // If escalated, create a tier-3 threat_event so the alert worker
+    // picks it up. Idempotent: skip if one already exists.
+    if (action === 'escalated') {
+      const existing = await pool.query('SELECT id FROM threat_events WHERE mention_id = $1 LIMIT 1', [req.params.id]);
+      if (!existing.rowCount) {
+        const m = await pool.query('SELECT target_id FROM mentions WHERE id = $1 AND customer_id = $2', [req.params.id, req.customer.id]);
+        await pool.query(`
+          INSERT INTO threat_events (mention_id, customer_id, target_id, tier, status)
+          VALUES ($1, $2, $3, 3, 'open')
+        `, [req.params.id, req.customer.id, m.rows[0]?.target_id || null]);
+      }
+    }
+    res.redirect('/dashboard/review-queue');
+  });
+
   // ── Settings: targets + emails + password ─────────────────────────
-  r.get('/dashboard/settings', auth, async (req, res) => {
+  r.get('/dashboard/settings', authed, async (req, res) => {
     const targets = await pool.query(`
       SELECT id, kind, name, aliases, search_terms FROM targets
       WHERE customer_id = $1 ORDER BY kind, name
@@ -840,7 +1009,7 @@ function build(pool) {
     res.send(layout({ title: 'Settings', customer: req.customer, body, active: 'settings', flash }));
   });
 
-  r.post('/dashboard/settings/emails', auth, express.urlencoded({ extended: false }), async (req, res) => {
+  r.post('/dashboard/settings/emails', authed, express.urlencoded({ extended: false }), async (req, res) => {
     const c = req.body.contact_email?.trim();
     const a = req.body.alert_email?.trim();
     const d = req.body.digest_email?.trim();
@@ -850,7 +1019,7 @@ function build(pool) {
     res.redirect('/dashboard/settings?ok=Emails+updated');
   });
 
-  r.post('/dashboard/settings/password', auth, express.urlencoded({ extended: false }), async (req, res) => {
+  r.post('/dashboard/settings/password', authed, express.urlencoded({ extended: false }), async (req, res) => {
     const cur = req.body.current_password || '';
     const next = req.body.new_password || '';
     const confirm = req.body.confirm_password || '';
@@ -865,13 +1034,13 @@ function build(pool) {
   });
 
   // ── Target add/edit/delete ─────────────────────────────────────────
-  r.get('/dashboard/targets/new', auth, (req, res) => {
+  r.get('/dashboard/targets/new', authed, (req, res) => {
     const body = renderTargetForm({ kind: 'candidate', name: '', aliases: [], search_terms: [] }, '/dashboard/targets/new', 'New target');
     res.set('Content-Type', 'text/html; charset=utf-8');
     res.send(layout({ title: 'New target', customer: req.customer, body, active: 'settings' }));
   });
 
-  r.post('/dashboard/targets/new', auth, express.urlencoded({ extended: false }), async (req, res) => {
+  r.post('/dashboard/targets/new', authed, express.urlencoded({ extended: false }), async (req, res) => {
     const t = parseTargetForm(req.body);
     if (!t.name) return res.redirect('/dashboard/settings?err=Target+name+required');
     await pool.query(`
@@ -883,7 +1052,7 @@ function build(pool) {
     res.redirect('/dashboard/settings?ok=Target+saved');
   });
 
-  r.get('/dashboard/targets/:id', auth, async (req, res) => {
+  r.get('/dashboard/targets/:id', authed, async (req, res) => {
     const q = await pool.query(`SELECT id, kind, name, aliases, search_terms FROM targets WHERE id = $1 AND customer_id = $2`, [req.params.id, req.customer.id]);
     if (!q.rowCount) return res.status(404).send('not found');
     const t = q.rows[0];
@@ -897,7 +1066,7 @@ function build(pool) {
     res.send(layout({ title: 'Edit target', customer: req.customer, body, active: 'settings' }));
   });
 
-  r.post('/dashboard/targets/:id', auth, express.urlencoded({ extended: false }), async (req, res) => {
+  r.post('/dashboard/targets/:id', authed, express.urlencoded({ extended: false }), async (req, res) => {
     const t = parseTargetForm(req.body);
     if (!t.name) return res.redirect(`/dashboard/targets/${req.params.id}?err=Target+name+required`);
     await pool.query(`
@@ -907,7 +1076,7 @@ function build(pool) {
     res.redirect('/dashboard/settings?ok=Target+saved');
   });
 
-  r.post('/dashboard/targets/:id/delete', auth, express.urlencoded({ extended: false }), async (req, res) => {
+  r.post('/dashboard/targets/:id/delete', authed, express.urlencoded({ extended: false }), async (req, res) => {
     // Soft-delete via status would be nicer; for v1 hard-delete is fine,
     // but only if no mentions reference it (otherwise FK breaks).
     // The mentions FK has no ON DELETE, so we set target_id to NULL on

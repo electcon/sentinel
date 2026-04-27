@@ -63,6 +63,15 @@ async function initSchema(pool) {
   await pool.query(`CREATE INDEX IF NOT EXISTS mentions_customer_time ON mentions (customer_id, posted_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS mentions_target_tier ON mentions (target_id, threat_tier) WHERE threat_tier >= 2`);
 
+  // Tier-2 human review queue. Tier 1 = noise (no action), Tier 2 =
+  // pending human review per THREAT_TAXONOMY rubric, Tier 3+ = handled
+  // via threat_events. review_status is NULL for non-Tier-2 mentions.
+  await pool.query(`ALTER TABLE mentions ADD COLUMN IF NOT EXISTS review_status TEXT`);
+  await pool.query(`ALTER TABLE mentions ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE mentions ADD COLUMN IF NOT EXISTS reviewed_by TEXT`);
+  await pool.query(`ALTER TABLE mentions ADD COLUMN IF NOT EXISTS review_notes TEXT`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS mentions_review_pending ON mentions (customer_id, ingested_at DESC) WHERE review_status = 'pending'`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS threat_events (
       id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
