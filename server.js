@@ -91,6 +91,18 @@ app.post('/api/_smoke/reddit-run', requireSmokeToken, async (req, res) => {
   }
 });
 
+// Trigger one Bluesky ingest run.
+app.post('/api/_smoke/bluesky-run', requireSmokeToken, async (req, res) => {
+  try {
+    const { runOnce } = require('./workers/bluesky');
+    const log = (m) => console.log(m);
+    const summary = await runOnce({ pool, log });
+    res.json(summary);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Idempotent dev-customer seeder. POST to provision the test customer
 // and dev targets (Cinde Warmington, Eileen Laubacher, Charlie Crist).
 app.post('/api/_smoke/seed-dev', requireSmokeToken, async (req, res) => {
