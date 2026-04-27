@@ -111,7 +111,11 @@ Required:
 
 Strongly recommended:
 - `ADMIN_PASSWORD` — gates `/admin`. Without it, `/admin` returns 404.
-- `RESEND_API_KEY` — without it, alerts/digests log "DRY-RUN" instead of sending
+- `RESEND_API_KEY` — without it, alerts/digests log "DRY-RUN" instead of sending.
+  **Important:** the FROM domain must be verified in the Resend account
+  attached to this key (see https://resend.com/domains). Defaults are
+  `alerts@voteroi.com` and `digest@voteroi.com`; override via
+  `ALERT_FROM_EMAIL` / `DIGEST_FROM_EMAIL` if your verified domain differs.
 - `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_BUCKET` —
   evidence archive (sentinel-evidence in us-east-2)
 
