@@ -86,6 +86,7 @@ function adminPage(title, body) {
   <a href="/admin/threats">threats</a>
   <a href="/admin/classifier-quality">classifier</a>
   <a href="/admin/telegram-channels">telegram</a>
+  <a href="/admin/leads">leads</a>
   <a href="/admin/audit">audit</a>
 </div>
 <div class="container">
@@ -774,6 +775,65 @@ function build(pool) {
     await pool.query(`DELETE FROM monitored_channels WHERE id = $1 AND source = 'telegram'`, [req.params.id]);
     await audit(req, 'delete', { targetType: 'monitored_channel', targetId: req.params.id, details: { channel_id: before.rows[0]?.channel_id } });
     res.redirect('/admin/telegram-channels?ok=Deleted');
+  });
+
+  // ── /admin/leads ──────────────────────────────────────────────────
+  // Beta-access form submissions. Operator follows up manually; once
+  // provisioned, mark status=converted via the /admin/leads/:id action.
+  r.get('/admin/leads', gate, async (req, res) => {
+    const flash = req.query.ok ? `<div style="background:#1a4a1a;color:#7fff7f;padding:10px;margin-bottom:14px;border-radius:4px">${escapeHtml(req.query.ok)}</div>` : '';
+    const q = await pool.query(`
+      SELECT id, campaign_name, contact_name, contact_email, role, state, message, ip,
+             status, contacted_at, provisioned_customer_id, created_at
+      FROM beta_leads
+      ORDER BY created_at DESC
+      LIMIT 200
+    `);
+    const statusPill = (s) => {
+      const colors = { new: '#1a3a5c', contacted: '#3d301a', qualified: '#2a5a8c', converted: '#1a4a1a', declined: '#5e0e16', spam: '#3d301a' };
+      const fg = { new: '#cfe5ff', contacted: '#d8902f', qualified: '#cfe5ff', converted: '#7fff7f', declined: '#ff7f7f', spam: '#d8902f' };
+      return `<span class="status-pill" style="background:${colors[s] || '#1c2330'};color:${fg[s] || '#8b949e'}">${escapeHtml(s)}</span>`;
+    };
+    const rows = q.rows.map(l => `
+      <tr>
+        <td><strong>${escapeHtml(l.campaign_name)}</strong>${l.state ? ` <span class="muted">(${escapeHtml(l.state)})</span>` : ''}</td>
+        <td>${escapeHtml(l.contact_name || '—')}<br><span class="muted" style="font-size:11px">${escapeHtml(l.role || '')}</span></td>
+        <td><a href="mailto:${escapeHtml(l.contact_email)}">${escapeHtml(l.contact_email)}</a></td>
+        <td>${statusPill(l.status)}</td>
+        <td class="muted">${ago(l.created_at)}</td>
+        <td class="muted" style="max-width:280px">${escapeHtml((l.message || '').slice(0, 200))}</td>
+        <td>
+          ${['contacted', 'qualified', 'converted', 'declined', 'spam'].map(s => `
+            <form method="POST" action="/admin/leads/${l.id}/status" style="display:inline">
+              <input type="hidden" name="status" value="${s}">
+              <button type="submit" style="background:#1c2330;color:#e6edf3;border:0;padding:3px 7px;border-radius:3px;cursor:pointer;font-size:10px;${l.status === s ? 'opacity:0.4' : ''}">→ ${s}</button>
+            </form>
+          `).join(' ')}
+        </td>
+      </tr>
+    `).join('');
+    const body = `
+      <h1>Beta-access leads</h1>
+      <div class="muted">Submissions from the public landing-page form.</div>
+      ${flash}
+      ${q.rowCount ? `<table style="margin-top:14px">
+        <thead><tr><th>Campaign</th><th>Contact</th><th>Email</th><th>Status</th><th>Submitted</th><th>Message</th><th>Actions</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>` : '<div class="muted" style="margin-top:14px">No leads yet. Form submissions land here automatically.</div>'}
+    `;
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(adminPage('leads', body));
+  });
+
+  r.post('/admin/leads/:id/status', gate, express.urlencoded({ extended: false }), async (req, res) => {
+    const newStatus = req.body.status;
+    if (!['new', 'contacted', 'qualified', 'converted', 'declined', 'spam'].includes(newStatus)) return res.redirect('/admin/leads?err=Bad+status');
+    const setContactedAt = ['contacted', 'qualified', 'converted', 'declined'].includes(newStatus);
+    await pool.query(`
+      UPDATE beta_leads SET status = $1, contacted_at = CASE WHEN $2::boolean AND contacted_at IS NULL THEN NOW() ELSE contacted_at END WHERE id = $3
+    `, [newStatus, setContactedAt, req.params.id]);
+    await audit(req, 'lead_status', { targetType: 'beta_lead', targetId: req.params.id, details: { new_status: newStatus } });
+    res.redirect('/admin/leads?ok=Lead+status+updated');
   });
 
   // ── /admin/audit ──────────────────────────────────────────────────

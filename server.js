@@ -491,10 +491,163 @@ app.use(require('./routes/dashboard')(pool));
 // ── Internal admin (Basic auth via ADMIN_PASSWORD) ─────────────────
 app.use(require('./routes/admin')(pool));
 
-// Root redirects to dashboard (authed) or login (unauthed). The
-// dashboard middleware itself handles the redirect by checking the
-// session cookie.
-app.get('/', (req, res) => res.redirect('/dashboard'));
+// Public landing page at root. Authed visitors get bounced straight to
+// /dashboard via the session-cookie check; unauthed visitors get a
+// one-page marketing splash + beta-access form.
+app.get('/', async (req, res) => {
+  // Cheap session check — if the cookie validates, redirect to dashboard.
+  try {
+    const { readSessionCookie, verifySession } = require('./lib/auth');
+    const tok = readSessionCookie(req);
+    if (tok && verifySession(tok)) return res.redirect('/dashboard');
+  } catch (_) { /* fall through to landing page */ }
+
+  const flash = req.query.thanks === '1'
+    ? '<div style="background:#1a4a1a;color:#7fff7f;padding:14px 20px;border-radius:8px;margin-bottom:24px;text-align:center;font-size:15px"><strong>Got it.</strong> We\'ll be in touch within 24 hours to schedule a 30-minute walkthrough.</div>'
+    : (req.query.err === '1' ? '<div style="background:#5e0e16;color:#fff;padding:12px 20px;border-radius:8px;margin-bottom:24px;text-align:center">Something went wrong submitting the form. Please email <a style="color:#fff" href="mailto:david@parallaxadvisory.llc">david@parallaxadvisory.llc</a> instead.</div>' : '');
+
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  res.send(`<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sentinel — defensive monitoring for political campaigns</title>
+<meta name="description" content="Sentinel watches Reddit, Bluesky, news, X, Telegram, and TruthSocial for threats and harassment against your candidate, family, and staff. Real-time tier-3 alerts.">
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: Inter, system-ui, -apple-system, sans-serif; background:#0a0f1a; color:#e6edf3; line-height:1.6 }
+  a { color:#4f9af0; text-decoration:none } a:hover { text-decoration:underline }
+  .nav { padding:18px 28px; display:flex; align-items:center; gap:24px; border-bottom:1px solid #1c2330 }
+  .brand { font-weight:700; letter-spacing:.06em }
+  .nav .right { margin-left:auto; font-size:14px }
+  .hero { max-width:840px; margin:0 auto; padding:64px 28px 32px; text-align:center }
+  .hero h1 { font-size:42px; line-height:1.15; margin:0 0 16px }
+  .hero h1 .accent { color:#4f9af0 }
+  .hero p.lede { font-size:18px; color:#cdd5e0; max-width:640px; margin:0 auto 24px }
+  .container { max-width:840px; margin:0 auto; padding:0 28px }
+  .row { display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:14px; margin:32px 0 }
+  .feature { background:#0e1422; border:1px solid #1c2330; border-radius:8px; padding:18px }
+  .feature h3 { margin:0 0 6px; font-size:15px; text-transform:uppercase; letter-spacing:.05em; color:#8b949e }
+  .feature p { margin:0; font-size:14px; color:#cdd5e0 }
+  .tiers { background:#0e1422; border:1px solid #1c2330; border-radius:8px; padding:24px; margin:32px 0 }
+  .tier { padding:10px 0; border-bottom:1px solid #1c2330; display:flex; align-items:flex-start; gap:14px }
+  .tier:last-child { border-bottom:0 } .tier-label { font-weight:600; min-width:120px }
+  .tier-1 .tier-label { color:#8b949e } .tier-2 .tier-label { color:#d8902f }
+  .tier-3 .tier-label { color:#e57e3a } .tier-4 .tier-label { color:#ff7080 }
+  .tier .desc { font-size:14px; color:#cdd5e0 }
+  .form-card { background:linear-gradient(180deg, #1a3a5c 0%, #0e1422 100%); border:1px solid #2a5a8c; border-radius:12px; padding:28px; margin:24px 0 48px }
+  .form-card h2 { margin:0 0 6px; font-size:22px; color:#e6edf3 }
+  .form-card .sub { color:#cdd5e0; font-size:14px; margin-bottom:18px }
+  .field { margin-bottom:14px }
+  .field label { display:block; color:#cdd5e0; font-size:13px; margin-bottom:5px }
+  .field input, .field textarea, .field select {
+    width:100%; background:#0a0f1a; border:1px solid #2a5a8c; color:#e6edf3;
+    padding:10px 12px; border-radius:5px; font-size:14px; font-family:inherit
+  }
+  .field textarea { min-height:80px; resize:vertical }
+  .actions button { background:#4f9af0; color:#fff; border:0; padding:12px 24px; border-radius:5px; font-size:15px; font-weight:500; cursor:pointer }
+  .actions button:hover { background:#3a85d8 }
+  footer { padding:32px 28px; text-align:center; color:#5b6573; font-size:12px; border-top:1px solid #1c2330; margin-top:48px }
+</style>
+</head><body>
+<div class="nav">
+  <div class="brand">SENTINEL</div>
+  <div class="right">
+    <a href="/login">Customer login</a>
+  </div>
+</div>
+
+<div class="hero">
+  <h1>Defensive social-media monitoring<br>for political campaigns.</h1>
+  <p class="lede">Sentinel watches public posts on <strong>Reddit, Bluesky, news, X, Telegram, and TruthSocial</strong> for mentions of your candidate, family, and staff. Threats and doxxing get a real-time email or Slack alert in under 5 minutes. Hostile rhetoric lands in a daily review queue. Noise stays out of your inbox.</p>
+</div>
+
+<div class="container">
+  ${flash}
+
+  <div class="row">
+    <div class="feature">
+      <h3>What we watch</h3>
+      <p>Reddit · Bluesky · Google News · X (twitterapi.io) · Telegram · TruthSocial. Public posts only. Per-target search + curated extremist-channel monitoring.</p>
+    </div>
+    <div class="feature">
+      <h3>How we classify</h3>
+      <p>Every mention runs through a 4-tier threat rubric. Conservative-bias model: when in doubt, escalate. Reviewer feedback feeds back into the rubric.</p>
+    </div>
+    <div class="feature">
+      <h3>How you're alerted</h3>
+      <p>Email + optional Slack/PagerDuty/custom-webhook for tier 3+. HMAC-signed payloads. Daily 7am digest of all activity. Evidence preserved on AWS S3 (Glacier after 90d) for legal hand-off.</p>
+    </div>
+  </div>
+
+  <div class="tiers">
+    <h2 style="margin:0 0 14px;font-size:18px">The 4-tier rubric</h2>
+    <div class="tier tier-1"><div class="tier-label">Tier 1 — noise</div><div class="desc">Routine criticism, mocking, dismissive content. Indexed for analytics; no alerts.</div></div>
+    <div class="tier tier-2"><div class="tier-label">Tier 2 — hostile</div><div class="desc">Personal attacks, dehumanizing language, family attacks. Lands in your review queue for human triage.</div></div>
+    <div class="tier tier-3"><div class="tier-label">Tier 3 — credible</div><div class="desc">Specific threats, doxxing of address/school/employer, calls for in-person confrontation. Real-time email alert in under 5 minutes.</div></div>
+    <div class="tier tier-4"><div class="tier-label">Tier 4 — imminent</div><div class="desc">Time-bound threats with location and weapon mentioned. Same as Tier 3 plus optional Slack/PagerDuty.</div></div>
+  </div>
+
+  <div class="form-card">
+    <h2>Request beta access</h2>
+    <div class="sub">Friendly cohort. $0/mo during beta (June 15 – September 15). 30-min Zoom walkthrough to scope your target list.</div>
+    <form method="POST" action="/beta-request">
+      <div class="field"><label for="campaign_name">Campaign / organization</label>
+        <input id="campaign_name" name="campaign_name" type="text" required placeholder="e.g. Jolly for Governor"></div>
+      <div class="field"><label for="contact_name">Your name</label>
+        <input id="contact_name" name="contact_name" type="text" placeholder="optional"></div>
+      <div class="field"><label for="contact_email">Email</label>
+        <input id="contact_email" name="contact_email" type="email" required placeholder="you@campaign.com"></div>
+      <div class="field"><label for="role">Your role</label>
+        <input id="role" name="role" type="text" placeholder="Campaign manager, chief of staff, comms director, etc."></div>
+      <div class="field"><label for="state">State (postal abbreviation, optional)</label>
+        <input id="state" name="state" type="text" maxlength="2" placeholder="NH" style="text-transform:uppercase"></div>
+      <div class="field"><label for="message">What threats / harassment are you currently dealing with?</label>
+        <textarea id="message" name="message" placeholder="Optional context — helps us scope the conversation."></textarea></div>
+      <div class="actions"><button type="submit">Request access</button></div>
+    </form>
+  </div>
+
+  <p style="text-align:center;color:#8b949e;font-size:13px;margin:24px 0 0">
+    Already a customer? <a href="/login">Log in here</a>.
+  </p>
+</div>
+
+<footer>
+  Sentinel · a product of Parallax Advisory LLC<br>
+  Sentinel is a monitoring tool, not a security service. Best-effort classification can miss credible threats. Customers retain responsibility for security posture and law-enforcement coordination.
+</footer>
+</body></html>`);
+});
+
+// Beta-request form handler. Captures lead, stores in beta_leads,
+// redirects with thanks message. Visible in /admin (via SQL query for
+// now; future /admin/leads page).
+app.post('/beta-request', express.urlencoded({ extended: false, limit: '64kb' }), async (req, res) => {
+  try {
+    const { campaign_name, contact_name, contact_email, role, state, message } = req.body || {};
+    if (!campaign_name || !contact_email) return res.redirect('/?err=1');
+    if (!/.+@.+\..+/.test(contact_email)) return res.redirect('/?err=1');
+    const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+    const ua = (req.headers['user-agent'] || '').slice(0, 500);
+    const cleanState = String(state || '').toUpperCase().trim();
+    await pool.query(`
+      INSERT INTO beta_leads (campaign_name, contact_name, contact_email, role, state, message, ip, user_agent, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'new')
+    `, [
+      String(campaign_name).slice(0, 200),
+      contact_name ? String(contact_name).slice(0, 200) : null,
+      String(contact_email).toLowerCase().slice(0, 200),
+      role ? String(role).slice(0, 200) : null,
+      /^[A-Z]{2}$/.test(cleanState) ? cleanState : null,
+      message ? String(message).slice(0, 4000) : null,
+      ip || null,
+      ua || null
+    ]);
+    res.redirect('/?thanks=1');
+  } catch (e) {
+    console.error('[beta-request]', e.message);
+    res.redirect('/?err=1');
+  }
+});
 
 // ── In-process scheduler ────────────────────────────────────────────
 // At v1 scale we run the ingest + alert workers directly inside the

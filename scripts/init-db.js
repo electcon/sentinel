@@ -215,6 +215,27 @@ async function initSchema(pool) {
   await pool.query(`CREATE INDEX IF NOT EXISTS operator_audit_recent ON operator_audit (created_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS operator_audit_target ON operator_audit (target_type, target_id, created_at DESC)`);
 
+  // Beta-access lead form (public landing-page submissions). Operator
+  // contacts these manually to qualify and provision via /admin/provision.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS beta_leads (
+      id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      campaign_name   TEXT NOT NULL,
+      contact_name    TEXT,
+      contact_email   TEXT NOT NULL,
+      role            TEXT,
+      state           CHAR(2),
+      message         TEXT,
+      ip              TEXT,
+      user_agent      TEXT,
+      status          TEXT NOT NULL DEFAULT 'new',
+      contacted_at    TIMESTAMPTZ,
+      provisioned_customer_id UUID REFERENCES customers(id),
+      created_at      TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS beta_leads_recent ON beta_leads (status, created_at DESC)`);
+
   // Per-tick worker run log. Lets the dashboard show "last ran X
   // minutes ago, processed N items, errored Y times." Old rows
   // pruned by a periodic VACUUM-style cleanup; for now we keep ~7d.
