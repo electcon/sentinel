@@ -110,11 +110,15 @@ module.exports = initSchema;
 
 // Allow `node scripts/init-db.js` for one-off CLI invocation.
 if (require.main === module) {
+  try { require('dotenv').config(); } catch (_) {}
   if (!process.env.DATABASE_URL) { console.error('DATABASE_URL not set'); process.exit(2); }
   const { Pool } = require('pg');
+  // Render Postgres requires SSL even from external hosts; rejectUnauthorized:false
+  // is the standard pattern (Render uses a self-signed-ish cert chain).
+  const useSSL = /render\.com/.test(process.env.DATABASE_URL) || process.env.NODE_ENV === 'production';
   const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+    ssl: useSSL ? { rejectUnauthorized: false } : false
   });
   initSchema(pool)
     .then(() => { console.log('[init-db] OK'); pool.end(); })
