@@ -257,6 +257,15 @@ function build(pool) {
     const workerByName = {};
     for (const w of workerHealth.rows) workerByName[w.worker_name] = w;
 
+    // 14-day mention volume by tier, for the chart.
+    const chartRaw = await pool.query(`
+      SELECT date_trunc('day', ingested_at)::date AS day, COALESCE(threat_tier, 1) AS tier, COUNT(*)::int AS n
+      FROM mentions
+      WHERE customer_id = $1 AND ingested_at >= NOW() - INTERVAL '14 days'
+      GROUP BY 1, 2
+      ORDER BY 1
+    `, [customerId]);
+
     const [threats, recent, counts] = await Promise.all([
       pool.query(`
         SELECT te.id, te.tier, te.status, te.created_at, te.alerted_at,
@@ -321,6 +330,9 @@ function build(pool) {
       if (ms < 86_400_000) return Math.floor(ms / 3_600_000) + 'h ago';
       return Math.floor(ms / 86_400_000) + 'd ago';
     };
+
+    // Build 14-day chart: stacked SVG bars by tier.
+    const chartHtml = renderVolumeChart(chartRaw.rows);
     const healthChip = (name) => {
       const w = workerByName[name];
       if (!w) return `<span class="muted">${name}: never run</span>`;
@@ -356,6 +368,9 @@ function build(pool) {
           ${workerNames.map(healthChip).join('')}
         </div>
       </div>
+
+      <h2>Mention volume — last 14 days</h2>
+      ${chartHtml}
 
       <h2>Open threats</h2>
       ${threats.rowCount ? `<table>
@@ -797,6 +812,74 @@ function parseTargetForm(body) {
     aliases: csvSplit(body.aliases),
     search_terms: csvSplit(body.search_terms)
   };
+}
+
+// Server-rendered 14-day stacked bar chart. Pure SVG, no JS, works
+// inside strict CSP. Input: rows of { day, tier, n }.
+function renderVolumeChart(rows) {
+  const W = 760, H = 160, PAD = 36;
+  const days = [];
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0);
+  for (let i = 13; i >= 0; i--) {
+    const d = new Date(today);
+    d.setUTCDate(d.getUTCDate() - i);
+    days.push(d.toISOString().slice(0, 10));
+  }
+  // Index: day → { 1: n, 2: n, 3: n, 4: n }
+  const byDay = new Map();
+  for (const d of days) byDay.set(d, { 1: 0, 2: 0, 3: 0, 4: 0 });
+  for (const r of rows) {
+    const key = (r.day instanceof Date ? r.day : new Date(r.day)).toISOString().slice(0, 10);
+    if (byDay.has(key)) byDay.get(key)[Math.max(1, Math.min(4, r.tier || 1))] += r.n;
+  }
+  const totals = days.map(d => Object.values(byDay.get(d)).reduce((a, b) => a + b, 0));
+  const max = Math.max(1, ...totals);
+  const barWidth = (W - 2 * PAD) / days.length;
+  const tierColors = { 1: '#5b6573', 2: '#a07f1a', 3: '#7a4a0a', 4: '#7a1019' };
+
+  let bars = '';
+  let labels = '';
+  let yGrid = '';
+  // Y-axis grid lines.
+  for (let i = 0; i <= 4; i++) {
+    const y = PAD + (H - 2 * PAD) * (i / 4);
+    const value = Math.round(max * (1 - i / 4));
+    yGrid += `<line x1="${PAD}" y1="${y}" x2="${W - PAD}" y2="${y}" stroke="#1c2330" stroke-width="1"/>`;
+    yGrid += `<text x="${PAD - 6}" y="${y + 4}" font-size="10" fill="#5b6573" text-anchor="end">${value}</text>`;
+  }
+  days.forEach((d, i) => {
+    const counts = byDay.get(d);
+    const x = PAD + i * barWidth;
+    let yCursor = H - PAD;
+    for (const tier of [1, 2, 3, 4]) {
+      const n = counts[tier];
+      if (!n) continue;
+      const h = ((H - 2 * PAD) * n) / max;
+      bars += `<rect x="${x + 4}" y="${yCursor - h}" width="${barWidth - 8}" height="${h}" fill="${tierColors[tier]}"><title>${d} · T${tier}: ${n}</title></rect>`;
+      yCursor -= h;
+    }
+    // X-axis labels: every other day to avoid clutter.
+    if (i % 2 === 0) {
+      labels += `<text x="${x + barWidth / 2}" y="${H - PAD + 14}" font-size="10" fill="#5b6573" text-anchor="middle">${d.slice(5)}</text>`;
+    }
+  });
+
+  const legend = `<g transform="translate(${PAD}, 10)">
+    ${[1, 2, 3, 4].map((t, idx) => `
+      <rect x="${idx * 80}" y="0" width="10" height="10" fill="${tierColors[t]}"/>
+      <text x="${idx * 80 + 14}" y="9" font-size="11" fill="#8b949e">T${t}</text>
+    `).join('')}
+  </g>`;
+
+  return `<div style="background:#0e1422;border:1px solid #1c2330;border-radius:6px;padding:10px;margin-bottom:14px;overflow-x:auto">
+    <svg viewBox="0 0 ${W} ${H + 30}" width="100%" preserveAspectRatio="xMidYMid meet" style="display:block;max-height:200px">
+      ${yGrid}
+      ${bars}
+      ${labels}
+      ${legend}
+    </svg>
+  </div>`;
 }
 
 function csvSplit(s) {
