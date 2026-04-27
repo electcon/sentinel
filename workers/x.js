@@ -48,6 +48,7 @@ async function runOnce({ pool, log = console.log }) {
   let totalSkipped = 0;
   let tier3Plus = 0;
   let errors = 0;
+  const errorDetails = [];
 
   const sinceTime = isoSinceWindow();
 
@@ -62,6 +63,7 @@ async function runOnce({ pool, log = console.log }) {
           results = await search(q, { sort: 'latest', sinceTime });
         } catch (e) {
           errors++;
+          errorDetails.push({ query: q, error: e.message.slice(0, 300) });
           log(`[x] query failed: ${q} — ${e.message}`);
           continue;
         }
@@ -95,7 +97,8 @@ async function runOnce({ pool, log = console.log }) {
     new_mentions: totalNew,
     skipped: totalSkipped,
     tier3_plus: tier3Plus,
-    errors
+    errors,
+    error_details: errorDetails.slice(0, 10)
   };
 }
 
