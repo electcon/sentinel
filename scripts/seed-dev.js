@@ -13,6 +13,7 @@
 try { require('dotenv').config(); } catch (_) {}
 
 const { Pool } = require('pg');
+const { hashPassword } = require('../lib/auth');
 
 const DEV_CUSTOMER = {
   name: 'Sentinel Dev (test)',
@@ -21,6 +22,12 @@ const DEV_CUSTOMER = {
   digest_email: 'david@voteroi.com',
   status: 'beta'
 };
+
+// Default dev login password. Anyone with shell access to the deployed
+// service or the GitHub repo can read this — it exists ONLY to make
+// the staging dev customer easy to log in as. Real beta customers go
+// through scripts/provision-customer.js with their own passwords.
+const DEV_PASSWORD = process.env.SENTINEL_DEV_PASSWORD || 'sentinel-dev-2026';
 
 // Real public political figures who get a steady volume of Reddit
 // mentions — good for verifying search hits land. None of these are
@@ -55,6 +62,11 @@ async function main() {
     ssl: useSSL ? { rejectUnauthorized: false } : false
   });
 
+  // Schema may pre-date password_hash column; idempotent ALTER.
+  await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS password_hash TEXT`);
+
+  const passwordHash = await hashPassword(DEV_PASSWORD);
+
   // Find-or-create the dev customer. We don't use ON CONFLICT here
   // because there's no unique constraint on customers.name in v1
   // (real customers can legitimately share names). The dev customer
@@ -63,16 +75,18 @@ async function main() {
   let customerId;
   if (existing.rowCount > 0) {
     customerId = existing.rows[0].id;
-    console.log('[seed] customer exists:', customerId);
+    await pool.query('UPDATE customers SET password_hash = $2 WHERE id = $1', [customerId, passwordHash]);
+    console.log('[seed] customer exists (password reset):', customerId);
   } else {
     const ins = await pool.query(`
-      INSERT INTO customers (name, contact_email, alert_email, digest_email, status)
-      VALUES ($1, $2, $3, $4, $5)
+      INSERT INTO customers (name, contact_email, alert_email, digest_email, status, password_hash)
+      VALUES ($1, $2, $3, $4, $5, $6)
       RETURNING id
-    `, [DEV_CUSTOMER.name, DEV_CUSTOMER.contact_email, DEV_CUSTOMER.alert_email, DEV_CUSTOMER.digest_email, DEV_CUSTOMER.status]);
+    `, [DEV_CUSTOMER.name, DEV_CUSTOMER.contact_email, DEV_CUSTOMER.alert_email, DEV_CUSTOMER.digest_email, DEV_CUSTOMER.status, passwordHash]);
     customerId = ins.rows[0].id;
     console.log('[seed] customer created:', customerId);
   }
+  console.log('[seed] login: ' + DEV_CUSTOMER.contact_email + ' / ' + DEV_PASSWORD);
 
   // Upsert each target. There's no natural unique key on (customer_id, name)
   // yet — add one if not present so we can ON CONFLICT.
