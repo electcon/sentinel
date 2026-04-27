@@ -8,6 +8,7 @@
 const crypto = require('crypto');
 const express = require('express');
 const { hashPassword } = require('../lib/auth');
+const { sendWelcome } = require('../lib/welcome');
 
 function escapeHtml(s) {
   return String(s == null ? '' : s)
@@ -342,6 +343,13 @@ function build(pool) {
           <label style="display:block;color:#8b949e;font-size:13px;margin-bottom:6px">Targets — one per line OR JSON array</label>
           <textarea name="targets" rows="10" placeholder='Either:&#10;Cinde Warmington&#10;Tom Sherman (her partner)&#10;&#10;Or:&#10;[&#10;  {"kind":"candidate","name":"Cinde Warmington","aliases":["Warmington"],"search_terms":["Cinde Warmington"]},&#10;  {"kind":"family","name":"Tom Sherman"}&#10;]' style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:13px;font-family:monospace"></textarea>
         </div>
+        <div style="margin-bottom:14px;background:#0e1422;padding:10px;border-radius:4px">
+          <label style="display:flex;align-items:center;gap:8px;color:#e6edf3;font-size:13px;cursor:pointer">
+            <input type="checkbox" name="send_welcome" value="1" checked style="width:auto;display:inline-block;margin:0">
+            Send welcome email to contact_email with login URL + password
+          </label>
+          <div style="color:#8b949e;font-size:12px;margin-top:4px">Skip if you'll deliver credentials via secure channel manually.</div>
+        </div>
         <button type="submit" style="background:#4f9af0;color:#fff;border:0;padding:10px 20px;border-radius:4px;font-size:14px;cursor:pointer">Provision</button>
       </form>
     `;
@@ -409,7 +417,29 @@ function build(pool) {
         `, [customerId, kind, t.name, JSON.stringify(aliases), JSON.stringify(searchTerms)]);
         if (r2.rows[0].inserted) created++; else updated++;
       }
-      const note = `${existing.rowCount > 0 ? 'updated' : 'created'} customer; ${created} new + ${updated} updated targets. Send credentials to ${contact_email} via secure channel.`;
+      // Optionally fire welcome email.
+      let welcomeNote = '';
+      if (req.body.send_welcome === '1' && existing.rowCount === 0) {
+        const loginUrl = (process.env.DASHBOARD_BASE_URL || 'https://sentinel-staging-i3ug.onrender.com') + '/login';
+        const out = await sendWelcome({
+          to: contact_email,
+          customerName: name,
+          password,
+          loginUrl,
+          alertEmail: alert_email,
+          digestEmail: digest_email,
+          targets: targets.map(t => ({ name: t.name, kind: t.kind || 'candidate' }))
+        });
+        if (out.ok) {
+          welcomeNote = out.dryRun ? ' Welcome email dry-run logged (no RESEND_API_KEY).' : ` Welcome email sent to ${contact_email}.`;
+        } else {
+          welcomeNote = ` Welcome email FAILED: ${out.error?.slice(0, 100)}.`;
+        }
+      } else if (req.body.send_welcome === '1' && existing.rowCount > 0) {
+        welcomeNote = ' (Welcome email skipped — customer existed; only re-send via CLI to avoid resend on every update.)';
+      }
+
+      const note = `${existing.rowCount > 0 ? 'updated' : 'created'} customer; ${created} new + ${updated} updated targets.${welcomeNote}`;
       res.redirect(`/admin/customers/${customerId}?ok=` + encodeURIComponent(note));
     } catch (e) {
       res.redirect('/admin/provision?err=' + encodeURIComponent(e.message.slice(0, 200)));

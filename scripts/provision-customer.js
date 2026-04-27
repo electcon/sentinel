@@ -128,49 +128,18 @@ async function main() {
 }
 
 async function sendWelcomeEmail({ spec, loginUrl }) {
-  const { Resend } = require('resend');
-  const resend = new Resend(process.env.RESEND_API_KEY);
-  const from = process.env.WELCOME_FROM_EMAIL || 'Sentinel <hello@sentinel.parallaxadvisory.llc>';
-  const text = [
-    `Hi — welcome to Sentinel.`,
-    ``,
-    `Your account is provisioned. Login here:`,
-    `  ${loginUrl}`,
-    ``,
-    `Email:    ${spec.contact_email}`,
-    `Password: ${spec.password}`,
-    ``,
-    `(Change the password on first login: Settings → Change password.)`,
-    ``,
-    `Tier-3+ alerts go to:  ${spec.alert_email}`,
-    `Daily digests go to:   ${spec.digest_email}`,
-    ``,
-    `Targets configured at onboarding:`,
-    ...(spec.targets || []).map(t => `  • ${t.name} (${t.kind || 'candidate'})`),
-    ``,
-    `If anything looks wrong, reply to this email.`,
-    ``,
-    `— David Wheeler`,
-    `Sentinel · a product of Parallax Advisory LLC`
-  ].join('\n');
-  const html = `<div style="font-family:Inter,system-ui,sans-serif;max-width:560px;margin:0 auto;color:#0a0f1a;line-height:1.5">
-    <h2>Welcome to Sentinel</h2>
-    <p>Your account is provisioned and ingest is running.</p>
-    <p><strong>Login:</strong> <a href="${loginUrl}">${loginUrl}</a><br>
-       <strong>Email:</strong> ${spec.contact_email}<br>
-       <strong>Password:</strong> <code style="background:#f4f6f8;padding:2px 6px;border-radius:4px">${spec.password}</code>
-       <br><span style="color:#666;font-size:13px">Change on first login: Settings → Change password.</span>
-    </p>
-    <p><strong>Tier-3+ alerts:</strong> ${spec.alert_email}<br>
-       <strong>Daily digest:</strong> ${spec.digest_email}</p>
-    <p><strong>Targets monitored:</strong></p>
-    <ul>${(spec.targets || []).map(t => `<li>${t.name} <span style="color:#666;font-size:13px">(${t.kind || 'candidate'})</span></li>`).join('')}</ul>
-    <p>Reply to this email if anything looks wrong.</p>
-    <p>— David Wheeler<br>
-    <span style="color:#666;font-size:13px">Sentinel · a product of Parallax Advisory LLC</span></p>
-  </div>`;
-  const r = await resend.emails.send({ from, to: spec.contact_email, subject: `Welcome to Sentinel — ${spec.name}`, text, html });
-  if (r.error) throw new Error(r.error.message || JSON.stringify(r.error));
+  const { sendWelcome } = require('../lib/welcome');
+  const out = await sendWelcome({
+    to: spec.contact_email,
+    customerName: spec.name,
+    password: spec.password,
+    loginUrl,
+    alertEmail: spec.alert_email,
+    digestEmail: spec.digest_email,
+    targets: spec.targets || []
+  });
+  if (!out.ok) throw new Error(out.error || 'send failed');
+  return out;
 }
 
 function validateSpec(s) {

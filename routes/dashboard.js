@@ -412,9 +412,40 @@ function build(pool) {
       </div>`;
     };
 
+    // First-login welcome banner if customer has zero data ingested.
+    // Triggered when both: 0 mentions in 24h AND no open threats AND
+    // no review-queue items. Tells the customer their account is wired
+    // and what to expect rather than showing empty tables.
+    const isFirstLogin = total24 === 0 && threats.rowCount === 0 && (req.customer.reviewQueueCount || 0) === 0;
+    const targetCount = await pool.query('SELECT COUNT(*)::int AS n FROM targets WHERE customer_id = $1', [customerId]);
+    const onboardingBanner = isFirstLogin
+      ? `<div style="background:linear-gradient(180deg, #1a3a5c 0%, #0e1422 100%);border:1px solid #2a5a8c;border-radius:8px;padding:24px;margin-bottom:18px">
+          <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+            <div style="width:32px;height:32px;border-radius:50%;background:#3a9c3a;display:inline-flex;align-items:center;justify-content:center;color:#fff;font-weight:600">✓</div>
+            <h2 style="margin:0;font-size:18px;text-transform:none;letter-spacing:0;color:#e6edf3">Account is live</h2>
+          </div>
+          <div style="font-size:14px;color:#cdd5e0;line-height:1.6">
+            <p style="margin:0 0 10px">Sentinel is now scanning <strong>Reddit, Bluesky, news (Google News), X, and Telegram</strong> for mentions of your ${targetCount.rows[0].n} target${targetCount.rows[0].n === 1 ? '' : 's'}. The first mentions usually appear within <strong>15&ndash;30 minutes</strong>.</p>
+            <p style="margin:0 0 10px"><strong>What to expect:</strong></p>
+            <ul style="margin:0 0 12px;padding-left:20px">
+              <li><strong>Tier 1</strong> (noise): visible in <a href="/dashboard/mentions">mentions</a> &mdash; no alerts. This is the bulk of activity.</li>
+              <li><strong>Tier 2</strong> (hostile rhetoric): lands in your <a href="/dashboard/review-queue">review queue</a> for human triage. We aim to surface ~5&ndash;20% of mentions here.</li>
+              <li><strong>Tier 3+</strong> (credible threats): real-time email alert + lands in your <a href="/dashboard/threats">threat queue</a>. Target latency: under 5 min.</li>
+            </ul>
+            <p style="margin:0 0 4px"><strong>Next steps:</strong></p>
+            <ul style="margin:0 0 4px;padding-left:20px">
+              <li>Visit <a href="/dashboard/settings">Settings</a> to add team-member emails or webhook routes (Slack/PagerDuty/etc.)</li>
+              <li>Refresh this page in 30 minutes to see initial activity</li>
+              <li>Daily digest emails arrive every morning even on quiet days</li>
+            </ul>
+          </div>
+        </div>` : '';
+
     const body = `
       <h1>Overview</h1>
       <div class="muted">${escapeHtml(req.customer.name)} — last 24 hours</div>
+
+      ${onboardingBanner}
 
       <div class="row" style="margin-top:24px;">
         <div class="card">
