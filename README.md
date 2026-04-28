@@ -1,13 +1,17 @@
 # Sentinel
 
 Defensive social-media + threat-monitoring platform for Dem and Indy-aligned
-political campaigns. Watches Reddit, Bluesky, news (Google News RSS), and X
-for mentions of customer-defined targets (candidate, family, staff). Classifies
-each mention with Claude against a 4-tier threat rubric. Sends real-time email
-alerts on tier 3+, daily email digests of all activity, preserves raw payloads
-in S3 for evidence handoff.
+political campaigns. Watches **Reddit, Bluesky (poll + Jetstream firehose),
+Google News RSS, X (twitterapi.io), Telegram, TruthSocial** for mentions of
+customer-defined targets (candidate, family, staff, opponents). Classifies each
+mention with Claude against a 4-tier threat rubric (with author-watch repeat-
+offender auto-bump). Sends real-time email or webhook alerts on tier 3+, weekly
++ daily activity digests, preserves raw payloads in S3 for evidence handoff,
+and exposes customer-facing read-only API + 24/7 SOC view.
 
-**Status:** v1 platform functionally complete (2026-04-27). Target ship: 2026-06-15.
+A product of **Parallax Advisory LLC** at `sentinel.parallaxadvisory.llc`.
+
+**Status:** v1 platform functionally complete; Sprint 2 (paid-conversion features) shipping. Target ship: 2026-06-15.
 
 Three friendly beta cohort:
 - Jolly for Governor
