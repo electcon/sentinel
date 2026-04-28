@@ -21,6 +21,7 @@ const {
   requireCustomerAuth
 } = require('../lib/auth');
 const { sendThreatAlert, generateWebhookSecret } = require('../lib/alert');
+const stripeClient = require('../lib/stripe-client');
 
 // Capture a reviewer disposition into classifier_feedback. Best-effort —
 // log failures but don't block the action. Called from both the
@@ -1165,6 +1166,44 @@ ${reviewRows}
     res.send(layout({ title: 'Mention', customer: req.customer, body, active: 'mentions' }));
   });
 
+  // ── Billing routes (customer-side) ────────────────────────────────
+  // After Stripe Checkout returns. ?status=success means the
+  // subscription was created (webhook will flip billing_status when it
+  // arrives — usually within a few seconds). ?status=cancel means the
+  // customer backed out.
+  r.get('/dashboard/billing/return', authed, async (req, res) => {
+    const status = req.query.status === 'success' ? 'success' : 'cancel';
+    const body = status === 'success'
+      ? `<h1 style="margin-top:14px">Subscription activated 🎉</h1>
+         <p>Thanks for upgrading to a paid Sentinel plan. Your subscription is being processed by Stripe; the billing status on your account will reflect it within a minute.</p>
+         <p>You can manage your card and billing details any time from <a href="/dashboard/settings">Settings</a>.</p>
+         <p><a href="/dashboard"><button>Back to dashboard</button></a></p>`
+      : `<h1 style="margin-top:14px">Checkout canceled</h1>
+         <p>No charge was made. You can re-open the checkout link any time, or reach out to your Sentinel onboarding contact if you have questions.</p>
+         <p><a href="/dashboard"><button class="secondary">Back to dashboard</button></a></p>`;
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(layout({ title: status === 'success' ? 'Subscription activated' : 'Checkout canceled', customer: req.customer, body, active: 'settings' }));
+  });
+
+  // Stripe Billing Portal — single-use redirect URL. Customers click
+  // "Manage billing" on /dashboard/settings and bounce to Stripe.
+  r.post('/dashboard/billing/portal', authed, express.urlencoded({ extended: false }), async (req, res) => {
+    if (!stripeClient.isConfigured()) return res.redirect('/dashboard/settings?err=Billing+not+configured');
+    try {
+      const c = await pool.query('SELECT stripe_customer_id FROM customers WHERE id = $1', [req.customer.id]);
+      const stripeCustomerId = c.rows[0]?.stripe_customer_id;
+      if (!stripeCustomerId) return res.redirect('/dashboard/settings?err=No+Stripe+customer+yet+%E2%80%94+contact+your+Sentinel+rep');
+      const baseUrl = process.env.DASHBOARD_BASE_URL || 'https://sentinel.parallaxadvisory.llc';
+      const session = await stripeClient.createBillingPortalSession({
+        stripeCustomerId,
+        returnUrl: `${baseUrl}/dashboard/settings`
+      });
+      res.redirect(session.url);
+    } catch (e) {
+      res.redirect('/dashboard/settings?err=' + encodeURIComponent('Billing portal error: ' + e.message.slice(0, 100)));
+    }
+  });
+
   // ── Tier-2 review queue ───────────────────────────────────────────
   // Tier-2 mentions land here (per THREAT_TAXONOMY: hostile rhetoric
   // without specific threats). Reviewer dismisses, escalates to T3,
@@ -1410,6 +1449,8 @@ ${reviewRows}
         </form>
       </details>
 
+      ${await renderBillingPanel(pool, req.customer)}
+
       <h2>Alert + digest emails</h2>
       <form method="POST" action="/dashboard/settings/emails">
         <div class="field">
@@ -1596,6 +1637,28 @@ ${reviewRows}
   });
 
   return r;
+}
+
+async function renderBillingPanel(pool, customer) {
+  const q = await pool.query(`SELECT billing_status, billing_amount_cents, billing_period, stripe_customer_id FROM customers WHERE id = $1`, [customer.id]);
+  const c = q.rows[0] || {};
+  const status = c.billing_status || 'free_beta';
+  const colors = { free_beta: ['#1a3a5c', '#cfe5ff'], trialing: ['#3d301a', '#d8902f'], active: ['#1a4a1a', '#7fff7f'], past_due: ['#5e0e16', '#ff7f7f'], canceled: ['#1c2330', '#8b949e'] };
+  const cc = colors[status] || ['#1c2330', '#8b949e'];
+  const amount = c.billing_amount_cents ? `$${(c.billing_amount_cents / 100).toFixed(0)} / ${c.billing_period === 'annual' ? 'year' : 'month'}` : '—';
+  const stripeOk = c.stripe_customer_id && (status === 'active' || status === 'trialing' || status === 'past_due');
+  return `<h2>Billing</h2>
+    <div class="card">
+      <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+        <div>
+          <div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.05em">Current plan</div>
+          <div style="margin-top:4px"><span class="pill" style="background:${cc[0]};color:${cc[1]}">${escapeHtml(status)}</span> <span class="muted" style="font-size:13px">${escapeHtml(amount)}</span></div>
+        </div>
+        ${stripeOk ? `<form method="POST" action="/dashboard/billing/portal" style="margin-left:auto"><button type="submit" class="secondary">Manage billing in Stripe →</button></form>` : ''}
+      </div>
+      ${status === 'free_beta' ? '<div class="muted" style="font-size:13px;margin-top:10px">You\'re on the free beta plan. Your Sentinel rep will reach out when it\'s time to upgrade.</div>' : ''}
+      ${status === 'past_due' ? '<div style="background:#5e0e16;color:#ff7f7f;padding:10px;border-radius:4px;margin-top:10px;font-size:13px">⚠ Your last payment failed. Use <strong>Manage billing</strong> to update your card or contact your Sentinel rep.</div>' : ''}
+    </div>`;
 }
 
 async function renderAlertRoutes(pool, customerId) {
