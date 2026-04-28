@@ -77,6 +77,7 @@ function adminPage(title, body, operator) {
   <a href="/admin/classifier-quality">classifier</a>
   <a href="/admin/telegram-channels">telegram</a>
   <a href="/admin/soc" style="background:#5e0e16;color:#fff;padding:3px 10px;border-radius:3px">SOC</a>
+  <a href="/admin/billing">billing</a>
   <a href="/admin/leads">leads</a>
   <a href="/admin/audit">audit</a>
   <a href="/admin/operators">operators</a>
@@ -1385,6 +1386,110 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
     `, [newStatus, setContactedAt, req.params.id]);
     await audit(req, 'lead_status', { targetType: 'beta_lead', targetId: req.params.id, details: { new_status: newStatus } });
     res.redirect('/admin/leads?ok=Lead+status+updated');
+  });
+
+  // ── /admin/billing — operator-side billing overview ───────────────
+  // MRR + customer counts by billing_status + past-due alerts + full
+  // customer list. Where David checks "how's the business doing?"
+  r.get('/admin/billing', gate, async (req, res) => {
+    const totals = await pool.query(`
+      SELECT billing_status, billing_period, billing_amount_cents,
+             COUNT(*)::int AS n,
+             SUM(
+               CASE
+                 WHEN billing_period = 'monthly' THEN billing_amount_cents
+                 WHEN billing_period = 'annual'  THEN billing_amount_cents / 12
+                 ELSE 0
+               END
+             )::bigint AS mrr_cents
+      FROM customers
+      WHERE billing_status IS NOT NULL
+      GROUP BY 1, 2, 3
+      ORDER BY billing_status, billing_period
+    `);
+
+    // Customer-by-customer detail
+    const detail = await pool.query(`
+      SELECT id, name, contact_email, billing_status, billing_amount_cents,
+             billing_period, billing_starts_at, stripe_customer_id,
+             stripe_subscription_id, last_login_at, billing_notes
+      FROM customers
+      ORDER BY
+        CASE billing_status
+          WHEN 'past_due' THEN 1
+          WHEN 'active'   THEN 2
+          WHEN 'trialing' THEN 3
+          WHEN 'free_beta'THEN 4
+          WHEN 'canceled' THEN 5
+          ELSE 6
+        END,
+        created_at DESC
+    `);
+
+    // Aggregate MRR across active+trialing
+    const liveStatuses = new Set(['active', 'trialing']);
+    let mrrCents = 0;
+    let activeCount = 0, trialingCount = 0, pastDueCount = 0, freeBetaCount = 0, canceledCount = 0;
+    for (const t of totals.rows) {
+      if (t.billing_status === 'active') activeCount += t.n;
+      else if (t.billing_status === 'trialing') trialingCount += t.n;
+      else if (t.billing_status === 'past_due') pastDueCount += t.n;
+      else if (t.billing_status === 'free_beta') freeBetaCount += t.n;
+      else if (t.billing_status === 'canceled') canceledCount += t.n;
+      if (liveStatuses.has(t.billing_status) && t.mrr_cents) mrrCents += Number(t.mrr_cents);
+    }
+    const mrr = (mrrCents / 100).toFixed(0);
+    const arr = (mrrCents * 12 / 100).toFixed(0);
+
+    const statusPill = (s) => {
+      const colors = { free_beta: ['#1a3a5c', '#cfe5ff'], trialing: ['#3d301a', '#d8902f'], active: ['#1a4a1a', '#7fff7f'], past_due: ['#5e0e16', '#ff7f7f'], canceled: ['#1c2330', '#8b949e'] };
+      const c = colors[s] || ['#1c2330', '#8b949e'];
+      return `<span class="pill" style="background:${c[0]};color:${c[1]}">${escapeHtml(s || '—')}</span>`;
+    };
+
+    const pastDueRows = detail.rows.filter(c => c.billing_status === 'past_due');
+    const pastDueBanner = pastDueRows.length
+      ? `<div style="background:#5e0e16;border-left:3px solid #ff7080;padding:12px 14px;margin:14px 0">
+           <strong style="color:#ff7080">⚠ ${pastDueRows.length} customer${pastDueRows.length === 1 ? '' : 's'} past_due:</strong>
+           ${pastDueRows.map(c => `<a href="/admin/customers/${c.id}" style="color:#ffaaaa">${escapeHtml(c.name)}</a>`).join(', ')}
+           — payment failed; reach out via secure channel and offer the customer the Manage-billing portal link.
+         </div>` : '';
+
+    const rows = detail.rows.map(c => `
+      <tr>
+        <td><strong>${escapeHtml(c.name)}</strong><div class="muted" style="font-size:11px">${escapeHtml(c.contact_email)}</div></td>
+        <td>${statusPill(c.billing_status || 'free_beta')}</td>
+        <td>${c.billing_amount_cents ? `$${(c.billing_amount_cents/100).toFixed(0)}/${c.billing_period === 'annual' ? 'yr' : 'mo'}` : '<span class="muted">—</span>'}</td>
+        <td class="muted">${fmtTime(c.billing_starts_at)}</td>
+        <td>${c.stripe_subscription_id ? `<code style="font-size:10px">${escapeHtml(c.stripe_subscription_id.slice(0, 16))}…</code>` : '<span class="muted">—</span>'}</td>
+        <td class="muted">${c.last_login_at ? ago(c.last_login_at) : 'never'}</td>
+        <td><a href="/admin/customers/${c.id}">open</a></td>
+      </tr>
+    `).join('');
+
+    const body = `
+      <h1>Billing overview</h1>
+      <div class="muted">${detail.rowCount} customer${detail.rowCount === 1 ? '' : 's'} total. Numbers below are based on operator-set billing_status; Stripe is the source of truth when wired (status auto-updates via webhook).</div>
+      ${pastDueBanner}
+
+      <div class="row" style="display:flex;gap:14px;margin:18px 0;flex-wrap:wrap">
+        <div class="card" style="flex:1 1 140px"><div class="muted">MRR</div><div style="font-size:24px;font-weight:700">$${mrr}</div></div>
+        <div class="card" style="flex:1 1 140px"><div class="muted">ARR (MRR × 12)</div><div style="font-size:24px;font-weight:700">$${arr}</div></div>
+        <div class="card" style="flex:1 1 100px"><div class="muted">Active</div><div style="font-size:22px;font-weight:600;color:#7fff7f">${activeCount}</div></div>
+        <div class="card" style="flex:1 1 100px"><div class="muted">Trialing</div><div style="font-size:22px;font-weight:600;color:#d8902f">${trialingCount}</div></div>
+        <div class="card" style="flex:1 1 100px"><div class="muted">Past due</div><div style="font-size:22px;font-weight:600;color:#ff7f7f">${pastDueCount}</div></div>
+        <div class="card" style="flex:1 1 100px"><div class="muted">Free beta</div><div style="font-size:22px;font-weight:600;color:#cfe5ff">${freeBetaCount}</div></div>
+        <div class="card" style="flex:1 1 100px"><div class="muted">Canceled</div><div style="font-size:22px;font-weight:600;color:#8b949e">${canceledCount}</div></div>
+      </div>
+
+      <h2>Customers</h2>
+      ${detail.rowCount ? `<table>
+        <thead><tr><th>Customer</th><th>Status</th><th>Plan</th><th>Started</th><th>Stripe sub</th><th>Last login</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>` : '<div class="muted">No customers yet.</div>'}
+    `;
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(adminPage('billing', body, req.operator));
   });
 
   // ── /admin/operators ──────────────────────────────────────────────
