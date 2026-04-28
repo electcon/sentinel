@@ -807,6 +807,213 @@ function build(pool) {
     res.send(layout({ title: 'Mentions', customer: req.customer, body, active: 'mentions' }));
   });
 
+  // ── Compliance report (HTML for print-to-PDF + JSON for systems) ─
+  // Single-page packet a customer hands to outside counsel or LE after
+  // an incident. Date-bounded; defaults to last 30 days.
+  // Format: `?format=html` (default) | `?format=json`
+  // Print: customer hits Ctrl-P / Cmd-P → "Save as PDF". Print stylesheet
+  // is opinionated about page breaks and contrast.
+  r.get('/dashboard/compliance-report', authed, async (req, res) => {
+    const today = new Date(); today.setUTCHours(23, 59, 59, 999);
+    const defaultFrom = new Date(today.getTime() - 30 * 86400 * 1000);
+    defaultFrom.setUTCHours(0, 0, 0, 0);
+    const fromIso = /^\d{4}-\d{2}-\d{2}$/.test(req.query.from) ? req.query.from : defaultFrom.toISOString().slice(0, 10);
+    const toIso = /^\d{4}-\d{2}-\d{2}$/.test(req.query.to) ? req.query.to : today.toISOString().slice(0, 10);
+    const from = new Date(fromIso + 'T00:00:00.000Z');
+    const to = new Date(toIso + 'T23:59:59.999Z');
+    const customerId = req.customer.id;
+
+    const [targets, mentionTotals, threats, reviews, sources] = await Promise.all([
+      pool.query(`SELECT id, kind, name, aliases, search_terms FROM targets WHERE customer_id = $1 ORDER BY kind, name`, [customerId]),
+      pool.query(`
+        SELECT
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (WHERE threat_tier = 4)::int AS t4,
+          COUNT(*) FILTER (WHERE threat_tier = 3)::int AS t3,
+          COUNT(*) FILTER (WHERE threat_tier = 2)::int AS t2,
+          COUNT(*) FILTER (WHERE threat_tier = 1)::int AS t1,
+          COUNT(*) FILTER (WHERE tier_bumped = TRUE)::int AS bumped
+        FROM mentions WHERE customer_id = $1 AND ingested_at >= $2 AND ingested_at <= $3
+      `, [customerId, from, to]),
+      pool.query(`
+        SELECT te.id, te.tier, te.status, te.created_at, te.alerted_at, te.resolved_at, te.notes,
+               m.body_excerpt, m.source, m.source_id, m.source_url, m.author_handle, m.posted_at, m.s3_key,
+               t.name AS target_name, t.kind AS target_kind
+        FROM threat_events te
+        JOIN mentions m ON m.id = te.mention_id
+        LEFT JOIN targets t ON t.id = te.target_id
+        WHERE te.customer_id = $1 AND te.created_at >= $2 AND te.created_at <= $3
+        ORDER BY te.tier DESC, te.created_at ASC
+      `, [customerId, from, to]),
+      pool.query(`
+        SELECT m.id, m.threat_tier, m.original_tier, m.body_excerpt, m.source, m.source_url, m.posted_at,
+               m.author_handle, m.review_status, m.reviewed_at, m.reviewed_by, m.review_notes,
+               t.name AS target_name
+        FROM mentions m
+        LEFT JOIN targets t ON t.id = m.target_id
+        WHERE m.customer_id = $1 AND m.review_status IS NOT NULL
+          AND m.reviewed_at >= $2 AND m.reviewed_at <= $3
+        ORDER BY m.reviewed_at DESC
+      `, [customerId, from, to]),
+      pool.query(`
+        SELECT source, COUNT(*)::int AS n FROM mentions
+        WHERE customer_id = $1 AND ingested_at >= $2 AND ingested_at <= $3
+        GROUP BY source ORDER BY n DESC
+      `, [customerId, from, to])
+    ]);
+
+    if (req.query.format === 'json') {
+      return res.json({
+        customer: { id: req.customer.id, name: req.customer.name },
+        coverage: { from: fromIso, to: toIso, sources_active: sources.rows },
+        targets: targets.rows,
+        mention_totals: mentionTotals.rows[0],
+        threat_events: threats.rows,
+        reviewed_mentions: reviews.rows,
+        generated_at: new Date().toISOString(),
+        report_kind: 'compliance.v1'
+      });
+    }
+
+    const m = mentionTotals.rows[0];
+    const targetSection = targets.rows.length
+      ? targets.rows.map(t => `<tr><td>${escapeHtml(t.kind || 'candidate')}</td><td>${escapeHtml(t.name)}</td><td>${escapeHtml((t.aliases||[]).join(', ') || '—')}</td><td>${escapeHtml((t.search_terms||[]).join(', ') || '—')}</td></tr>`).join('')
+      : '<tr><td colspan="4" style="color:#999">No targets configured.</td></tr>';
+
+    const sourcesSection = sources.rows.length
+      ? sources.rows.map(s => `<tr><td>${escapeHtml(s.source)}</td><td style="text-align:right">${s.n}</td></tr>`).join('')
+      : '<tr><td colspan="2" style="color:#999">No mentions in period.</td></tr>';
+
+    const tierLabelMap = { 4: 'Tier 4 — imminent violence', 3: 'Tier 3 — credible threat / doxxing', 2: 'Tier 2 — hostile rhetoric', 1: 'Tier 1 — noise' };
+
+    const threatRows = threats.rows.length
+      ? threats.rows.map((t, i) => `
+        <div class="threat-event" style="page-break-inside:avoid">
+          <h3 style="margin:18px 0 4px">#${i + 1} — Tier ${t.tier} · ${escapeHtml(t.target_name || '—')} · ${escapeHtml(t.target_kind || 'candidate')}</h3>
+          <table class="kv">
+            <tr><td>Tier</td><td><strong>${escapeHtml(tierLabelMap[t.tier] || ('Tier ' + t.tier))}</strong></td></tr>
+            <tr><td>Status</td><td>${escapeHtml(t.status)}</td></tr>
+            <tr><td>Source</td><td>${escapeHtml(t.source)} · ${escapeHtml(t.author_handle || 'unknown author')}</td></tr>
+            <tr><td>URL</td><td style="word-break:break-all">${escapeHtml(t.source_url || '—')}</td></tr>
+            <tr><td>Posted at</td><td>${fmtTime(t.posted_at)}</td></tr>
+            <tr><td>Detected by Sentinel</td><td>${fmtTime(t.created_at)}</td></tr>
+            <tr><td>Alert sent</td><td>${fmtTime(t.alerted_at)}</td></tr>
+            <tr><td>Resolved</td><td>${fmtTime(t.resolved_at)}</td></tr>
+            <tr><td>Evidence archive key</td><td><code style="font-size:11px">${escapeHtml(t.s3_key || 'not archived')}</code></td></tr>
+          </table>
+          <div class="quote" style="margin-top:6px">${escapeHtml((t.body_excerpt || '').slice(0, 1000))}</div>
+          ${t.notes ? `<div class="notes"><strong>Audit trail:</strong><pre>${escapeHtml(t.notes)}</pre></div>` : ''}
+        </div>
+      `).join('')
+      : '<p style="color:#666">No threat events in this period.</p>';
+
+    const reviewRows = reviews.rows.length
+      ? `<table class="data"><thead><tr><th>Disposition</th><th>Tier</th><th>Target</th><th>Excerpt</th><th>Reviewed by</th><th>Reviewed at</th></tr></thead><tbody>` +
+        reviews.rows.map(r => `<tr>
+          <td>${escapeHtml(r.review_status)}</td>
+          <td>T${r.threat_tier}${r.original_tier && r.original_tier !== r.threat_tier ? ` (was T${r.original_tier})` : ''}</td>
+          <td>${escapeHtml(r.target_name || '—')}</td>
+          <td>${escapeHtml((r.body_excerpt || '').slice(0, 140))}</td>
+          <td>${escapeHtml(r.reviewed_by || '—')}</td>
+          <td>${fmtTime(r.reviewed_at)}</td>
+        </tr>`).join('') + '</tbody></table>'
+      : '<p style="color:#666">No reviewer dispositions in this period.</p>';
+
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Compliance report — ${escapeHtml(req.customer.name)}</title>
+<style>
+  body { font-family: 'Times New Roman', Times, serif; color: #111; max-width: 850px; margin: 0 auto; padding: 32px; line-height: 1.5; background: #fff; }
+  h1 { font-size: 22pt; margin: 0 0 4pt; }
+  h2 { font-size: 14pt; margin: 18pt 0 6pt; padding-bottom: 4pt; border-bottom: 1px solid #999; page-break-after: avoid; }
+  h3 { font-size: 12pt; margin: 12pt 0 6pt; }
+  .header-meta { color: #555; font-size: 11pt; margin-bottom: 6pt; }
+  .conf-stamp { display: inline-block; padding: 4pt 10pt; border: 2pt solid #7a1019; color: #7a1019; font-weight: 700; font-size: 10pt; letter-spacing: .1em; margin-bottom: 12pt; }
+  table { width: 100%; border-collapse: collapse; font-size: 11pt; margin: 8pt 0; }
+  table.kv td:first-child { width: 28%; color: #555; padding: 3pt 6pt; vertical-align: top; }
+  table.kv td:last-child { padding: 3pt 6pt; }
+  table.data th, table.data td { border: 1px solid #999; padding: 4pt 6pt; text-align: left; vertical-align: top; }
+  table.data th { background: #eee; font-weight: 600; }
+  .quote { border-left: 3pt solid #7a4a0a; padding: 6pt 10pt; margin: 6pt 0; background: #fafafa; font-style: italic; white-space: pre-wrap; }
+  .notes pre { background: #f5f5f5; padding: 6pt; font-size: 10pt; white-space: pre-wrap; font-family: inherit; }
+  .summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10pt; margin: 8pt 0; }
+  .summary-grid > div { border: 1px solid #ccc; padding: 8pt; }
+  .summary-grid .n { font-size: 18pt; font-weight: 700; color: #111; }
+  .summary-grid .lbl { color: #555; font-size: 10pt; }
+  .footer { margin-top: 24pt; padding-top: 12pt; border-top: 1px solid #ccc; font-size: 9pt; color: #555; }
+  .toolbar { background: #f0f0f0; border: 1px solid #ccc; padding: 12pt; border-radius: 4pt; margin-bottom: 18pt; display: flex; align-items: center; gap: 12pt; }
+  .toolbar form { display: flex; gap: 8pt; align-items: center; }
+  .toolbar input[type=date] { padding: 4pt 6pt; border: 1px solid #999; border-radius: 3pt; }
+  .toolbar button, .toolbar a { background: #1a3a5c; color: #fff; padding: 6pt 14pt; border-radius: 3pt; text-decoration: none; border: 0; cursor: pointer; font-size: 11pt; }
+  @media print {
+    .toolbar, .no-print { display: none !important; }
+    body { padding: 0; }
+    h2 { page-break-before: auto; }
+    .threat-event { page-break-inside: avoid; }
+  }
+</style>
+</head><body>
+
+<div class="toolbar no-print">
+  <form method="GET" action="/dashboard/compliance-report">
+    <label>From <input type="date" name="from" value="${escapeHtml(fromIso)}"></label>
+    <label>To <input type="date" name="to" value="${escapeHtml(toIso)}"></label>
+    <button type="submit">Update</button>
+  </form>
+  <button type="button" onclick="window.print()">Print / Save as PDF</button>
+  <a href="/dashboard/compliance-report?format=json&from=${escapeHtml(fromIso)}&to=${escapeHtml(toIso)}">JSON</a>
+  <a href="/dashboard">← back</a>
+</div>
+
+<div class="conf-stamp">CONFIDENTIAL — ATTORNEY WORK PRODUCT</div>
+<h1>Sentinel Compliance Report</h1>
+<div class="header-meta">
+  <strong>${escapeHtml(req.customer.name)}</strong><br>
+  Period: ${escapeHtml(fromIso)} → ${escapeHtml(toIso)}<br>
+  Generated: ${escapeHtml(new Date().toISOString())}<br>
+  Provider: Parallax Advisory LLC · sentinel.parallaxadvisory.llc
+</div>
+
+<h2>1. Coverage</h2>
+<p>This report covers automated monitoring of public social-media and news content for mentions of the targets listed below, during the period stated. Sources actively ingested for this customer during the period:</p>
+<table class="data">
+  <thead><tr><th>Source</th><th style="text-align:right">Mentions</th></tr></thead>
+  <tbody>${sourcesSection}</tbody>
+</table>
+
+<h3>Targets monitored</h3>
+<table class="data">
+  <thead><tr><th>Kind</th><th>Name</th><th>Aliases</th><th>Search terms</th></tr></thead>
+  <tbody>${targetSection}</tbody>
+</table>
+
+<h2>2. Activity summary</h2>
+<div class="summary-grid">
+  <div><div class="n">${m.total}</div><div class="lbl">Total mentions</div></div>
+  <div><div class="n">${m.t4}</div><div class="lbl">Tier 4 (imminent)</div></div>
+  <div><div class="n">${m.t3}</div><div class="lbl">Tier 3 (credible)</div></div>
+  <div><div class="n">${m.t2}</div><div class="lbl">Tier 2 (hostile)</div></div>
+</div>
+<p style="font-size: 10pt; color: #555;">Tier 1 (noise): ${m.t1} · Auto-tier-bumped (repeat-offender heuristic): ${m.bumped}</p>
+
+<h2>3. Threat events</h2>
+<p style="font-size: 10pt; color: #555;">All threat events of any tier raised during the reporting period, with timeline, audit trail, and evidence keys. Each event corresponds to one S3-archived raw payload retrievable on request from Parallax Advisory LLC for legal or law-enforcement coordination.</p>
+${threatRows}
+
+<h2>4. Tier-2 review dispositions</h2>
+<p style="font-size: 10pt; color: #555;">Hostile-rhetoric mentions reviewed and dispositioned by the customer's team during the period.</p>
+${reviewRows}
+
+<h2>5. Methodology</h2>
+<p style="font-size: 10pt;">Sentinel ingests public posts via documented platform-search interfaces (Reddit anonymous .json, Bluesky AT-Proto public search and Jetstream firehose, Google News RSS, twitterapi.io, Telegram t.me/s/ public preview, TruthSocial Mastodon-API v2). Each post containing a mention of one of the targets above (alias-matched) is classified by an LLM (Anthropic Claude Haiku 4.5) against a 4-tier rubric (noise → hostile rhetoric → credible threat / doxxing → imminent violence). Conservative-bias setting bumps borderline cases up one tier; the same author repeating tier-2-or-above content within 30 days is auto-bumped one tier. Raw payloads are preserved in AWS S3 with 30-day Standard / 90-day Glacier lifecycle.</p>
+
+<div class="footer">
+  Sentinel — a product of Parallax Advisory LLC. Sentinel is a monitoring tool, not a security service. Best-effort classification can miss credible threats. Customers retain responsibility for security posture, law-enforcement coordination, and physical safety. Generated automatically; no human review of report contents prior to delivery. Data accuracy as of generated_at timestamp.
+</div>
+
+</body></html>`);
+  });
+
   // ── CSV export for mentions ────────────────────────────────────────
   r.get('/dashboard/mentions.csv', authed, async (req, res) => {
     const tierFilter = req.query.tier;
@@ -1153,6 +1360,7 @@ function build(pool) {
         <a href="/dashboard/targets/new"><button type="button">+ Add target</button></a>
         <a href="/dashboard/mentions.csv"><button type="button" class="secondary">↓ Export mentions CSV</button></a>
         <a href="/dashboard/threats.csv"><button type="button" class="secondary">↓ Export threats CSV</button></a>
+        <a href="/dashboard/compliance-report"><button type="button" class="secondary">📄 Compliance report (print to PDF)</button></a>
       </div>
 
       <h2>Bulk import targets</h2>
