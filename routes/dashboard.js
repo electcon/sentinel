@@ -318,6 +318,47 @@ function build(pool) {
       ORDER BY 1
     `, [customerId]);
 
+    // Per-target risk: 30d activity + threats + repeat offenders, summed
+    // into a transparent score. Visible on the dashboard so customers
+    // know which target needs attention.
+    //   score = mentions + (3 × T2+) + (10 × threats) + repeat_offender_bonus
+    // Tiers:  ≥ 100 high · ≥ 40 elevated · ≥ 10 moderate · < 10 low
+    const targetRisk = await pool.query(`
+      SELECT t.id, t.name, t.kind,
+             COALESCE(m.total, 0)::int          AS mentions_30d,
+             COALESCE(m.t2plus, 0)::int         AS t2plus_30d,
+             COALESCE(te.n, 0)::int             AS threats_30d,
+             COALESCE(o.n, 0)::int              AS repeat_authors_30d,
+             COALESCE(m.last_at, NULL)          AS last_mention_at
+      FROM targets t
+      LEFT JOIN (
+        SELECT target_id,
+               COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE threat_tier >= 2) AS t2plus,
+               MAX(ingested_at) AS last_at
+        FROM mentions
+        WHERE customer_id = $1 AND ingested_at > NOW() - INTERVAL '30 days'
+        GROUP BY target_id
+      ) m ON m.target_id = t.id
+      LEFT JOIN (
+        SELECT target_id, COUNT(*) AS n FROM threat_events
+        WHERE customer_id = $1 AND created_at > NOW() - INTERVAL '30 days'
+        GROUP BY target_id
+      ) te ON te.target_id = t.id
+      LEFT JOIN (
+        SELECT target_id, COUNT(DISTINCT author_handle) AS n
+        FROM mentions
+        WHERE customer_id = $1
+          AND ingested_at > NOW() - INTERVAL '30 days'
+          AND author_handle IS NOT NULL AND author_handle <> ''
+          AND threat_tier >= 2
+        GROUP BY target_id
+        HAVING COUNT(*) FILTER (WHERE threat_tier >= 2) >= 3
+      ) o ON o.target_id = t.id
+      WHERE t.customer_id = $1
+      ORDER BY t.name
+    `, [customerId]);
+
     const [threats, recent, counts] = await Promise.all([
       pool.query(`
         SELECT te.id, te.tier, te.status, te.created_at, te.alerted_at,
@@ -466,6 +507,34 @@ function build(pool) {
           ${workerNames.map(healthChip).join('')}
         </div>
       </div>
+
+      ${(() => {
+        if (!targetRisk.rowCount) return '';
+        const riskLabel = (s) => s >= 100 ? 'high' : s >= 40 ? 'elevated' : s >= 10 ? 'moderate' : 'low';
+        const riskColors = { high: '#7a1019', elevated: '#a04400', moderate: '#7a4a0a', low: '#1c2330' };
+        const riskFg = { high: '#ff7080', elevated: '#e57e3a', moderate: '#d8902f', low: '#8b949e' };
+        const rows = targetRisk.rows.map(t => {
+          const score = (t.mentions_30d || 0) + 3 * (t.t2plus_30d || 0) + 10 * (t.threats_30d || 0) + 5 * (t.repeat_authors_30d || 0);
+          const lvl = riskLabel(score);
+          const since = t.last_mention_at ? ago(t.last_mention_at) : 'never';
+          return `<tr>
+            <td><strong>${escapeHtml(t.name)}</strong> <span class="muted">(${escapeHtml(t.kind || 'candidate')})</span></td>
+            <td>${t.mentions_30d}</td>
+            <td>${t.t2plus_30d}</td>
+            <td>${t.threats_30d}</td>
+            <td>${t.repeat_authors_30d}</td>
+            <td><span class="pill" style="background:${riskColors[lvl]};color:${riskFg[lvl]}">${lvl}</span> <span class="muted" style="font-size:11px">${score}</span></td>
+            <td class="muted">${since}</td>
+          </tr>`;
+        }).join('');
+        return `
+        <h2>Per-target activity — last 30 days</h2>
+        <div class="muted" style="font-size:12px;margin-bottom:8px">Score = mentions + 3×T2+ + 10×threats + 5×repeat-authors. Pill: low &lt; 10 · moderate ≥ 10 · elevated ≥ 40 · high ≥ 100.</div>
+        <table>
+          <thead><tr><th>Target</th><th>Mentions</th><th>T2+</th><th>Threats</th><th>Repeat authors</th><th>Risk</th><th>Last seen</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+      })()}
 
       <h2>Mention volume — last 14 days</h2>
       ${chartHtml}
