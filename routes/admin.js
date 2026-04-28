@@ -262,19 +262,25 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
       LEFT JOIN (SELECT customer_id, COUNT(*) AS n FROM mentions GROUP BY customer_id) m ON m.customer_id = c.id
       ORDER BY c.created_at DESC
     `);
+    const billingPill = (s) => {
+      const colors = { free_beta: ['#1a3a5c', '#cfe5ff'], trialing: ['#3d301a', '#d8902f'], active: ['#1a4a1a', '#7fff7f'], past_due: ['#5e0e16', '#ff7f7f'], canceled: ['#1c2330', '#8b949e'] };
+      const c = colors[s] || ['#1c2330', '#8b949e'];
+      return `<span class="pill" style="background:${c[0]};color:${c[1]}">${escapeHtml(s || '—')}</span>`;
+    };
     const rows = r2.rows.map(c => {
       const inactive = !c.last_login_at || (Date.now() - new Date(c.last_login_at).getTime() > 30 * 86400 * 1000);
       const loginCell = c.last_login_at
         ? `${ago(c.last_login_at)}${inactive ? ' <span class="pill" style="background:#3d301a;color:#d8902f">inactive</span>' : ''}<div class="muted" style="font-size:11px">${c.login_count || 0} logins</div>`
         : '<span class="pill" style="background:#5e0e16;color:#ff7f7f">never</span>';
+      const billingCell = `${billingPill(c.billing_status)}${c.billing_amount_cents ? `<div class="muted" style="font-size:11px">$${(c.billing_amount_cents/100).toFixed(0)}/${c.billing_period === 'annual' ? 'yr' : 'mo'}</div>` : ''}`;
       return `
       <tr>
         <td><strong>${escapeHtml(c.name)}</strong><div class="muted">${escapeHtml(c.id)}</div></td>
         <td><span class="pill ok">${escapeHtml(c.status)}</span></td>
+        <td>${billingCell}</td>
         <td>${c.target_count}</td>
         <td>${c.mention_count}</td>
         <td class="muted">${escapeHtml(c.contact_email)}</td>
-        <td class="muted">${escapeHtml(c.alert_email)}</td>
         <td>${loginCell}</td>
         <td class="muted">${fmtTime(c.created_at)}</td>
         <td>${c.password_hash ? '<span class="pill ok">set</span>' : '<span class="pill err">no pw</span>'}</td>
@@ -287,7 +293,7 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
       ${flash}
       <div style="margin:14px 0"><a href="/admin/provision"><button style="background:#4f9af0;color:#fff;border:0;padding:8px 14px;border-radius:4px;cursor:pointer;font-size:13px">+ Provision new customer</button></a></div>
       <table>
-        <thead><tr><th>Name / ID</th><th>Status</th><th>Targets</th><th>Mentions</th><th>Contact</th><th>Alert</th><th>Last login</th><th>Created</th><th>PW</th><th></th></tr></thead>
+        <thead><tr><th>Name / ID</th><th>Status</th><th>Billing</th><th>Targets</th><th>Mentions</th><th>Contact</th><th>Last login</th><th>Created</th><th>PW</th><th></th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     `;
@@ -355,6 +361,64 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
         <div class="muted">last login: ${cust.last_login_at ? `${ago(cust.last_login_at)} (${fmtTime(cust.last_login_at)})` : '<em>never</em>'} · ${cust.login_count || 0} logins total</div>
       </div>
       ${riskPanel}
+
+      <div class="card" style="margin-top:14px">
+        <div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Billing</div>
+        <div style="display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:14px;margin-bottom:10px">
+          <div class="muted">status</div><div>${(() => {
+            const colors = { free_beta: ['#1a3a5c', '#cfe5ff'], trialing: ['#3d301a', '#d8902f'], active: ['#1a4a1a', '#7fff7f'], past_due: ['#5e0e16', '#ff7f7f'], canceled: ['#1c2330', '#8b949e'] };
+            const cc = colors[cust.billing_status] || ['#1c2330', '#8b949e'];
+            return `<span class="pill" style="background:${cc[0]};color:${cc[1]}">${escapeHtml(cust.billing_status || 'free_beta')}</span>`;
+          })()}</div>
+          <div class="muted">amount</div><div>${cust.billing_amount_cents ? `$${(cust.billing_amount_cents/100).toFixed(2)} / ${cust.billing_period || 'monthly'}` : '<em>—</em>'}</div>
+          <div class="muted">starts</div><div>${fmtTime(cust.billing_starts_at)}</div>
+          <div class="muted">stripe customer</div><div><code>${escapeHtml(cust.stripe_customer_id || '—')}</code></div>
+          <div class="muted">stripe subscription</div><div><code>${escapeHtml(cust.stripe_subscription_id || '—')}</code></div>
+          ${cust.billing_notes ? `<div class="muted">notes</div><div>${escapeHtml(cust.billing_notes)}</div>` : ''}
+        </div>
+        <details>
+          <summary style="cursor:pointer;color:#4f9af0;font-size:13px;padding:6px 0">Update billing (manual until Stripe is wired)</summary>
+          <form method="POST" action="/admin/customers/${cust.id}/billing" style="margin-top:8px;background:#0a0f1a;padding:14px;border:1px solid #1c2330;border-radius:4px">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
+              <div>
+                <label style="display:block;color:#8b949e;font-size:11px;margin-bottom:3px">Status</label>
+                <select name="billing_status" style="background:#0e1422;border:1px solid #1c2330;color:#e6edf3;padding:6px 8px;border-radius:3px;width:100%;font-size:13px">
+                  ${['free_beta','trialing','active','past_due','canceled'].map(s => `<option value="${s}"${cust.billing_status === s ? ' selected' : ''}>${s}</option>`).join('')}
+                </select>
+              </div>
+              <div>
+                <label style="display:block;color:#8b949e;font-size:11px;margin-bottom:3px">Period</label>
+                <select name="billing_period" style="background:#0e1422;border:1px solid #1c2330;color:#e6edf3;padding:6px 8px;border-radius:3px;width:100%;font-size:13px">
+                  <option value="">— none —</option>
+                  <option value="monthly"${cust.billing_period === 'monthly' ? ' selected' : ''}>monthly</option>
+                  <option value="annual"${cust.billing_period === 'annual' ? ' selected' : ''}>annual</option>
+                </select>
+              </div>
+              <div>
+                <label style="display:block;color:#8b949e;font-size:11px;margin-bottom:3px">Amount (USD)</label>
+                <input type="number" name="billing_amount_usd" min="0" step="1" value="${cust.billing_amount_cents ? (cust.billing_amount_cents/100).toFixed(0) : ''}" placeholder="500" style="background:#0e1422;border:1px solid #1c2330;color:#e6edf3;padding:6px 8px;border-radius:3px;width:100%;font-size:13px">
+              </div>
+              <div>
+                <label style="display:block;color:#8b949e;font-size:11px;margin-bottom:3px">Starts at (YYYY-MM-DD)</label>
+                <input type="date" name="billing_starts_at" value="${cust.billing_starts_at ? new Date(cust.billing_starts_at).toISOString().slice(0,10) : ''}" style="background:#0e1422;border:1px solid #1c2330;color:#e6edf3;padding:6px 8px;border-radius:3px;width:100%;font-size:13px">
+              </div>
+            </div>
+            <div style="margin-bottom:10px">
+              <label style="display:block;color:#8b949e;font-size:11px;margin-bottom:3px">Stripe customer ID (optional, paste from Stripe dashboard once wired)</label>
+              <input type="text" name="stripe_customer_id" value="${escapeHtml(cust.stripe_customer_id || '')}" placeholder="cus_..." style="background:#0e1422;border:1px solid #1c2330;color:#e6edf3;padding:6px 8px;border-radius:3px;width:100%;font-size:13px;font-family:monospace">
+            </div>
+            <div style="margin-bottom:10px">
+              <label style="display:block;color:#8b949e;font-size:11px;margin-bottom:3px">Stripe subscription ID</label>
+              <input type="text" name="stripe_subscription_id" value="${escapeHtml(cust.stripe_subscription_id || '')}" placeholder="sub_..." style="background:#0e1422;border:1px solid #1c2330;color:#e6edf3;padding:6px 8px;border-radius:3px;width:100%;font-size:13px;font-family:monospace">
+            </div>
+            <div style="margin-bottom:10px">
+              <label style="display:block;color:#8b949e;font-size:11px;margin-bottom:3px">Notes</label>
+              <textarea name="billing_notes" rows="2" style="background:#0e1422;border:1px solid #1c2330;color:#e6edf3;padding:6px 8px;border-radius:3px;width:100%;font-size:13px">${escapeHtml(cust.billing_notes || '')}</textarea>
+            </div>
+            <button type="submit" style="background:#4f9af0;color:#fff;border:0;padding:8px 14px;border-radius:3px;cursor:pointer;font-size:13px">Save billing</button>
+          </form>
+        </details>
+      </div>
       <h2>Targets (${targets.rowCount})</h2>
       ${targets.rowCount ? `<table><thead><tr><th>Kind</th><th>Name</th><th>Aliases</th><th>Search terms</th></tr></thead><tbody>${targetRows}</tbody></table>` : '<div class="muted">No targets.</div>'}
       <h2>Recent mentions (${recent.rowCount})</h2>
@@ -362,6 +426,40 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
     `;
     res.set('Content-Type', 'text/html; charset=utf-8');
     res.send(adminPage('customer', body, req.operator));
+  });
+
+  // POST handler for the manual billing-update form. No Stripe API
+  // calls — just persists what the operator types so the schema is
+  // accurate when Stripe webhooks land in Sprint 3.
+  r.post('/admin/customers/:id/billing', gate, express.urlencoded({ extended: false }), async (req, res) => {
+    const validStatus = ['free_beta', 'trialing', 'active', 'past_due', 'canceled'];
+    const billing_status = validStatus.includes(req.body.billing_status) ? req.body.billing_status : 'free_beta';
+    const billing_period = ['monthly', 'annual'].includes(req.body.billing_period) ? req.body.billing_period : null;
+    const usd = parseFloat(req.body.billing_amount_usd);
+    const billing_amount_cents = Number.isFinite(usd) && usd >= 0 ? Math.round(usd * 100) : null;
+    const billing_starts_at = req.body.billing_starts_at && /^\d{4}-\d{2}-\d{2}$/.test(req.body.billing_starts_at) ? req.body.billing_starts_at : null;
+    const stripe_customer_id = (req.body.stripe_customer_id || '').trim() || null;
+    const stripe_subscription_id = (req.body.stripe_subscription_id || '').trim() || null;
+    const billing_notes = (req.body.billing_notes || '').trim().slice(0, 1000) || null;
+
+    await pool.query(`
+      UPDATE customers
+      SET billing_status = $2,
+          billing_period = $3,
+          billing_amount_cents = $4,
+          billing_starts_at = $5,
+          stripe_customer_id = $6,
+          stripe_subscription_id = $7,
+          billing_notes = $8
+      WHERE id = $1
+    `, [req.params.id, billing_status, billing_period, billing_amount_cents, billing_starts_at, stripe_customer_id, stripe_subscription_id, billing_notes]);
+
+    await audit(req, 'billing_update', {
+      targetType: 'customer',
+      targetId: req.params.id,
+      details: { billing_status, billing_period, billing_amount_cents, billing_starts_at, stripe_customer_id, stripe_subscription_id }
+    });
+    res.redirect(`/admin/customers/${req.params.id}?ok=Billing+updated`);
   });
 
   // ── /admin/workers ────────────────────────────────────────────────
