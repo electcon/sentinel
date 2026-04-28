@@ -517,8 +517,11 @@ function build(pool) {
           const score = (t.mentions_30d || 0) + 3 * (t.t2plus_30d || 0) + 10 * (t.threats_30d || 0) + 5 * (t.repeat_authors_30d || 0);
           const lvl = riskLabel(score);
           const since = t.last_mention_at ? ago(t.last_mention_at) : 'never';
+          const kindBadge = t.kind === 'opponent'
+            ? ' <span style="background:#3d2050;color:#c89dff;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600;letter-spacing:.04em">OPPONENT</span>'
+            : ` <span class="muted">(${escapeHtml(t.kind || 'candidate')})</span>`;
           return `<tr>
-            <td><strong>${escapeHtml(t.name)}</strong> <span class="muted">(${escapeHtml(t.kind || 'candidate')})</span></td>
+            <td><strong>${escapeHtml(t.name)}</strong>${kindBadge}</td>
             <td>${t.mentions_30d}</td>
             <td>${t.t2plus_30d}</td>
             <td>${t.threats_30d}</td>
@@ -702,6 +705,7 @@ function build(pool) {
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
     const tierFilter = req.query.tier;
     const sourceFilter = req.query.source;
+    const kindFilter = req.query.kind;
     const search = (req.query.q || '').trim().slice(0, 200);
     const args = [req.customer.id];
     const wheres = [];
@@ -712,6 +716,11 @@ function build(pool) {
     if (sourceFilter && /^[a-z_]+$/i.test(sourceFilter)) {
       args.push(sourceFilter);
       wheres.push(`m.source = $${args.length}`);
+    }
+    if (kindFilter === 'opponent') {
+      wheres.push(`t.kind = 'opponent'`);
+    } else if (kindFilter === 'own') {
+      wheres.push(`(t.kind IS NULL OR t.kind <> 'opponent')`);
     }
     if (search) {
       args.push('%' + search + '%');
@@ -734,16 +743,19 @@ function build(pool) {
       const params = new URLSearchParams();
       const tier = overrides.tier !== undefined ? overrides.tier : tierFilter;
       const source = overrides.source !== undefined ? overrides.source : sourceFilter;
+      const kindf = overrides.kind !== undefined ? overrides.kind : kindFilter;
       const q = overrides.q !== undefined ? overrides.q : search;
       if (tier && tier !== 'all') params.set('tier', tier);
       if (source && source !== 'all') params.set('source', source);
+      if (kindf && kindf !== 'all') params.set('kind', kindf);
       if (q) params.set('q', q);
       return params.toString() ? '?' + params.toString() : '';
     };
 
     const filterPill = (kind, val, label) => {
       const active = kind === 'tier' ? (tierFilter || 'all') === val
-                    : kind === 'source' ? (sourceFilter || 'all') === val : false;
+                    : kind === 'source' ? (sourceFilter || 'all') === val
+                    : kind === 'kind' ? (kindFilter || 'all') === val : false;
       const overrides = {};
       overrides[kind] = val === 'all' ? '' : val;
       return `<a href="/dashboard/mentions${baseQs(overrides)}" class="pill" style="background:${active ? '#4f9af0' : '#1c2330'};color:${active ? '#fff' : '#8b949e'};margin-right:6px;">${escapeHtml(label)}</a>`;
@@ -777,7 +789,13 @@ function build(pool) {
       <div style="margin:8px 0">
         <span class="muted" style="font-size:12px;margin-right:8px">source:</span>
         ${filterPill('source', 'all', 'all')}
-        ${['reddit','bluesky','rss','x','synth'].map(s => filterPill('source', s, s)).join('')}
+        ${['reddit','bluesky','rss','x','telegram','truthsocial','synth'].map(s => filterPill('source', s, s)).join('')}
+      </div>
+      <div style="margin:8px 0">
+        <span class="muted" style="font-size:12px;margin-right:8px">target type:</span>
+        ${filterPill('kind', 'all', 'all')}
+        ${filterPill('kind', 'own', 'own targets')}
+        ${filterPill('kind', 'opponent', 'opponents')}
       </div>
       <div class="muted" style="margin-top:14px;font-size:12px">${q.rowCount} result${q.rowCount === 1 ? '' : 's'}${search ? ' matching "' + escapeHtml(search) + '"' : ''}</div>
       ${q.rowCount ? `<table style="margin-top:8px">
@@ -878,7 +896,7 @@ function build(pool) {
     for (const t of parsed) {
       if (!t || !t.name) { skipped++; continue; }
       const kindRaw = String(t.kind || 'candidate').trim();
-      const kind = ['candidate','family','staff','surrogate'].includes(kindRaw) ? kindRaw : 'candidate';
+      const kind = ['candidate','family','staff','surrogate','opponent'].includes(kindRaw) ? kindRaw : 'candidate';
       const aliases = Array.isArray(t.aliases) ? t.aliases : [];
       const search_terms = Array.isArray(t.search_terms) ? t.search_terms : [];
       const r2 = await pool.query(`
@@ -1420,7 +1438,7 @@ async function renderAlertRoutes(pool, customerId) {
 
 function parseTargetForm(body) {
   const kindRaw = String(body.kind || '').trim();
-  const kind = ['candidate', 'family', 'staff', 'surrogate'].includes(kindRaw) ? kindRaw : 'candidate';
+  const kind = ['candidate', 'family', 'staff', 'surrogate', 'opponent'].includes(kindRaw) ? kindRaw : 'candidate';
   return {
     kind,
     name: String(body.name || '').trim(),
@@ -1524,7 +1542,7 @@ function renderTargetForm(t, action, title) {
       <div class="field">
         <label for="kind">Kind</label>
         <select id="kind" name="kind" style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px 12px;border-radius:4px;font-size:14px;width:100%">
-          ${['candidate','family','staff','surrogate'].map(k => `<option value="${k}" ${t.kind === k ? 'selected' : ''}>${k}</option>`).join('')}
+          ${['candidate','family','staff','surrogate','opponent'].map(k => `<option value="${k}" ${t.kind === k ? 'selected' : ''}>${k}</option>`).join('')}
         </select>
       </div>
       <div class="field">

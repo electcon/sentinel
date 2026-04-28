@@ -716,7 +716,7 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
       let created = 0, updated = 0;
       for (const t of targets) {
         const kindRaw = String(t.kind || 'candidate').trim();
-        const kind = ['candidate', 'family', 'staff', 'surrogate'].includes(kindRaw) ? kindRaw : 'candidate';
+        const kind = ['candidate', 'family', 'staff', 'surrogate', 'opponent'].includes(kindRaw) ? kindRaw : 'candidate';
         const aliases = Array.isArray(t.aliases) ? t.aliases : [];
         const searchTerms = Array.isArray(t.search_terms) ? t.search_terms : [t.name];
         const r2 = await pool.query(`
