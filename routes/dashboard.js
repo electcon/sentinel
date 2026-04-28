@@ -636,7 +636,7 @@ function build(pool) {
         <div class="key-value">
           <div>target</div><div>${escapeHtml(t.target_name || '—')} (${escapeHtml(t.target_kind || '—')})</div>
           <div>source</div><div>${escapeHtml(t.source)}</div>
-          <div>author</div><div>${escapeHtml(t.author_handle || '—')}</div>
+          <div>author</div><div>${t.author_handle ? `<a href="/dashboard/authors/${encodeURIComponent(t.author_handle)}" style="font-family:monospace">${escapeHtml(t.author_handle)}</a>` : '—'}</div>
           <div>posted</div><div>${fmtTime(t.posted_at)}</div>
           <div>detected</div><div>${fmtTime(t.created_at)}</div>
           <div>alerted</div><div>${fmtTime(t.alerted_at)}</div>
@@ -732,6 +732,7 @@ function build(pool) {
     const q = await pool.query(`
       SELECT m.id, m.threat_tier, m.tier_bumped, m.original_tier, m.bump_reason,
              m.source, m.source_url, m.posted_at, m.body_excerpt, m.rationale,
+             m.author_handle,
              t.name AS target_name
       FROM mentions m
       LEFT JOIN targets t ON t.id = m.target_id
@@ -767,7 +768,8 @@ function build(pool) {
         <td>${tierPill(m.threat_tier)}${m.tier_bumped ? ` <span title="Auto-bumped from T${m.original_tier || '?'} (${escapeHtml(m.bump_reason || '')})" style="background:#5e0e16;color:#ff7f7f;padding:1px 5px;border-radius:2px;font-size:9px;font-weight:600;letter-spacing:.05em">BUMP</span>` : ''}</td>
         <td>${escapeHtml(m.target_name || '—')}</td>
         <td>${escapeHtml(m.source)}</td>
-        <td>${escapeHtml((m.body_excerpt || '').slice(0, 140))}</td>
+        <td>${m.author_handle ? `<a href="/dashboard/authors/${encodeURIComponent(m.author_handle)}" style="font-family:monospace;font-size:12px">${escapeHtml(m.author_handle.slice(0, 24))}</a>` : '<span class="muted">—</span>'}</td>
+        <td>${escapeHtml((m.body_excerpt || '').slice(0, 130))}</td>
         <td>${fmtTime(m.posted_at)}</td>
         <td><a href="/dashboard/mentions/${m.id}">open</a></td>
       </tr>
@@ -800,7 +802,7 @@ function build(pool) {
       </div>
       <div class="muted" style="margin-top:14px;font-size:12px">${q.rowCount} result${q.rowCount === 1 ? '' : 's'}${search ? ' matching "' + escapeHtml(search) + '"' : ''}</div>
       ${q.rowCount ? `<table style="margin-top:8px">
-        <thead><tr><th>Tier</th><th>Target</th><th>Source</th><th>Excerpt</th><th>Posted</th><th></th></tr></thead>
+        <thead><tr><th>Tier</th><th>Target</th><th>Source</th><th>Author</th><th>Excerpt</th><th>Posted</th><th></th></tr></thead>
         <tbody>${rows}</tbody>
       </table>` : '<div class="empty">No mentions match these filters.</div>'}
     `;
@@ -1119,6 +1121,104 @@ ${reviewRows}
     res.redirect(`/dashboard/settings?ok=Imported+${created}+new+%2F+${updated}+updated+%28${format}%29${skipped ? '+%2F+' + skipped + '+skipped' : ''}`);
   });
 
+  // ── Author detail (per-handle history for this customer) ─────────
+  // Click an author handle anywhere in the dashboard to land here. Shows
+  // all mentions by that author for THIS customer, plus stats useful
+  // for triage (first seen, total T2+, targets touched).
+  r.get('/dashboard/authors/:handle', authed, async (req, res) => {
+    const handle = decodeURIComponent(req.params.handle).slice(0, 200);
+    if (!handle) return res.status(400).send('handle required');
+    const [stats, mentions] = await Promise.all([
+      pool.query(`
+        SELECT
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (WHERE threat_tier = 4)::int AS t4,
+          COUNT(*) FILTER (WHERE threat_tier = 3)::int AS t3,
+          COUNT(*) FILTER (WHERE threat_tier = 2)::int AS t2,
+          COUNT(*) FILTER (WHERE threat_tier = 1)::int AS t1,
+          COUNT(*) FILTER (WHERE tier_bumped = TRUE)::int AS bumped,
+          MIN(ingested_at) AS first_seen,
+          MAX(ingested_at) AS last_seen,
+          array_agg(DISTINCT source) AS sources
+        FROM mentions WHERE customer_id = $1 AND author_handle = $2
+      `, [req.customer.id, handle]),
+      pool.query(`
+        SELECT m.id, m.threat_tier, m.tier_bumped, m.original_tier, m.bump_reason,
+               m.source, m.source_url, m.posted_at, m.body_excerpt,
+               t.name AS target_name, t.kind AS target_kind
+        FROM mentions m
+        LEFT JOIN targets t ON t.id = m.target_id
+        WHERE m.customer_id = $1 AND m.author_handle = $2
+        ORDER BY m.ingested_at DESC LIMIT 200
+      `, [req.customer.id, handle])
+    ]);
+
+    if (mentions.rowCount === 0) {
+      const body = `
+        <a href="/dashboard/mentions" class="muted">← back</a>
+        <h1 style="margin-top:14px">${escapeHtml(handle)}</h1>
+        <div class="empty">No mentions for this author yet.</div>`;
+      res.set('Content-Type', 'text/html; charset=utf-8');
+      return res.send(layout({ title: handle, customer: req.customer, body, active: 'mentions' }));
+    }
+
+    const s = stats.rows[0];
+    const repeatThreshold = parseInt(process.env.REPEAT_OFFENDER_THRESHOLD, 10) || 3;
+    const isFlagged = (s.t2 + s.t3 + s.t4) >= repeatThreshold;
+    const targetCount = new Set(mentions.rows.map(m => m.target_name).filter(Boolean)).size;
+
+    const rows = mentions.rows.map(m => `
+      <tr>
+        <td>${tierPill(m.threat_tier)}${m.tier_bumped ? ` <span title="auto-bumped" style="background:#5e0e16;color:#ff7f7f;padding:1px 5px;border-radius:2px;font-size:9px;font-weight:600">BUMP</span>` : ''}</td>
+        <td>${escapeHtml(m.target_name || '—')}</td>
+        <td>${escapeHtml(m.source)}</td>
+        <td>${escapeHtml((m.body_excerpt || '').slice(0, 160))}</td>
+        <td>${fmtTime(m.posted_at)}</td>
+        <td><a href="/dashboard/mentions/${m.id}">open</a></td>
+      </tr>
+    `).join('');
+
+    const body = `
+      <a href="/dashboard/mentions" class="muted">← all mentions</a>
+      <h1 style="margin-top:14px">${escapeHtml(handle)}${isFlagged ? ' <span style="background:#5e0e16;color:#ff7f7f;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:600;letter-spacing:.05em;vertical-align:middle">FLAGGED</span>' : ''}</h1>
+      <div class="muted">${s.total} mentions across ${(s.sources || []).length} source${(s.sources || []).length === 1 ? '' : 's'} · ${targetCount} target${targetCount === 1 ? '' : 's'} touched</div>
+
+      <div class="row" style="margin-top:18px">
+        <div class="card">
+          <div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">By tier</div>
+          <div style="font-size:13px;line-height:1.8">
+            <strong style="color:#ff7080">T4: ${s.t4}</strong><br>
+            <strong style="color:#e57e3a">T3: ${s.t3}</strong><br>
+            <strong style="color:#d8902f">T2: ${s.t2}</strong><br>
+            <span style="color:#8b949e">T1: ${s.t1}</span>
+            ${s.bumped > 0 ? `<br><span style="color:#ff7080;font-size:11px">${s.bumped} auto-bumped</span>` : ''}
+          </div>
+        </div>
+        <div class="card">
+          <div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">Activity window</div>
+          <div style="font-size:13px;line-height:1.8">
+            First seen: <strong>${fmtTime(s.first_seen)}</strong><br>
+            Last seen: <strong>${fmtTime(s.last_seen)}</strong><br>
+            <span class="muted">${ago(s.last_seen)}</span>
+          </div>
+        </div>
+        <div class="card">
+          <div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">Sources</div>
+          <div style="font-size:13px;line-height:1.8">${(s.sources || []).map(escapeHtml).join('<br>')}</div>
+        </div>
+      </div>
+
+      <h2>Mentions (${mentions.rowCount})</h2>
+      <table>
+        <thead><tr><th>Tier</th><th>Target</th><th>Source</th><th>Excerpt</th><th>Posted</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      ${mentions.rowCount === 200 ? '<div class="muted" style="margin-top:8px;font-size:12px">Showing most recent 200 mentions.</div>' : ''}
+    `;
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(layout({ title: handle, customer: req.customer, body, active: 'mentions' }));
+  });
+
   // ── Mention detail ─────────────────────────────────────────────────
   r.get('/dashboard/mentions/:id', authed, async (req, res) => {
     const q = await pool.query(`
@@ -1146,7 +1246,7 @@ ${reviewRows}
       <div class="card" style="margin-top:20px">
         <div class="key-value">
           <div>source</div><div>${escapeHtml(m.source)}</div>
-          <div>author</div><div>${escapeHtml(m.author_handle || '—')}</div>
+          <div>author</div><div>${m.author_handle ? `<a href="/dashboard/authors/${encodeURIComponent(m.author_handle)}" style="font-family:monospace">${escapeHtml(m.author_handle)}</a>` : '—'}</div>
           <div>posted</div><div>${fmtTime(m.posted_at)}</div>
           <div>ingested</div><div>${fmtTime(m.ingested_at)}</div>
           <div>url</div><div><a href="${escapeHtml(m.source_url)}" target="_blank" rel="noopener">${escapeHtml(m.source_url || '—')}</a></div>
@@ -1338,7 +1438,7 @@ ${reviewRows}
         <div class="key-value">
           <div>target</div><div>${escapeHtml(m.target_name || '—')} (${escapeHtml(m.target_kind || '—')})</div>
           <div>source</div><div>${escapeHtml(m.source)}</div>
-          <div>author</div><div>${escapeHtml(m.author_handle || '—')}</div>
+          <div>author</div><div>${m.author_handle ? `<a href="/dashboard/authors/${encodeURIComponent(m.author_handle)}" style="font-family:monospace">${escapeHtml(m.author_handle)}</a>` : '—'}</div>
           <div>posted</div><div>${fmtTime(m.posted_at)}</div>
           <div>ingested</div><div>${fmtTime(m.ingested_at)}</div>
           <div>url</div><div><a href="${escapeHtml(m.source_url)}" target="_blank" rel="noopener">${escapeHtml(m.source_url || '—')}</a></div>
