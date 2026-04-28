@@ -308,17 +308,39 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
     if (!c.rowCount) return res.status(404).send('not found');
     const cust = c.rows[0];
 
-    const [targets, recent] = await Promise.all([
+    const [targets, recent, repeatOffenders] = await Promise.all([
       pool.query('SELECT id, kind, name, aliases, search_terms FROM targets WHERE customer_id = $1 ORDER BY name', [req.params.id]),
       pool.query(`
-        SELECT m.id, m.threat_tier, m.source, m.source_url, m.posted_at, m.body_excerpt, t.name AS target_name
+        SELECT m.id, m.threat_tier, m.tier_bumped, m.source, m.source_url, m.posted_at, m.body_excerpt, t.name AS target_name
         FROM mentions m LEFT JOIN targets t ON t.id = m.target_id
         WHERE m.customer_id = $1 ORDER BY m.ingested_at DESC LIMIT 25
+      `, [req.params.id]),
+      pool.query(`
+        SELECT author_handle, source,
+               COUNT(*) FILTER (WHERE threat_tier >= 2)::int AS bad_count,
+               COUNT(*)::int AS total_count,
+               MAX(ingested_at) AS last_seen
+        FROM mentions
+        WHERE customer_id = $1 AND author_handle IS NOT NULL AND author_handle <> ''
+          AND ingested_at > NOW() - INTERVAL '30 days'
+        GROUP BY author_handle, source
+        HAVING COUNT(*) FILTER (WHERE threat_tier >= 2) >= 2
+        ORDER BY bad_count DESC, last_seen DESC
+        LIMIT 10
       `, [req.params.id])
     ]);
 
     const targetRows = targets.rows.map(t => `<tr><td>${escapeHtml(t.kind)}</td><td>${escapeHtml(t.name)}</td><td class="muted">${escapeHtml((t.aliases || []).join(', '))}</td><td class="muted">${escapeHtml((t.search_terms || []).join(', '))}</td></tr>`).join('');
-    const mentionRows = recent.rows.map(m => `<tr><td>T${m.threat_tier || '—'}</td><td>${escapeHtml(m.target_name || '—')}</td><td>${escapeHtml(m.source)}</td><td>${escapeHtml((m.body_excerpt || '').slice(0, 120))}</td><td class="muted">${ago(m.posted_at)}</td></tr>`).join('');
+    const mentionRows = recent.rows.map(m => `<tr><td>T${m.threat_tier || '—'}${m.tier_bumped ? ' <span style="background:#5e0e16;color:#ff7f7f;padding:1px 4px;border-radius:2px;font-size:9px;font-weight:600">BUMP</span>' : ''}</td><td>${escapeHtml(m.target_name || '—')}</td><td>${escapeHtml(m.source)}</td><td>${escapeHtml((m.body_excerpt || '').slice(0, 120))}</td><td class="muted">${ago(m.posted_at)}</td></tr>`).join('');
+    const offenderRows = repeatOffenders.rows.map(r => {
+      const flagged = r.bad_count >= 3;
+      return `<tr>
+        <td><strong>${escapeHtml(r.author_handle)}</strong>${flagged ? ' <span style="background:#5e0e16;color:#ff7f7f;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600">FLAGGED</span>' : ''}</td>
+        <td>${escapeHtml(r.source)}</td>
+        <td><strong>${r.bad_count}</strong> T2+ <span class="muted">/ ${r.total_count} total</span></td>
+        <td class="muted">${ago(r.last_seen)}</td>
+      </tr>`;
+    }).join('');
 
     const flash = req.query.ok ? `<div style="background:#1a4a1a;color:#7fff7f;padding:10px;margin-bottom:14px;border-radius:4px">${escapeHtml(req.query.ok)}</div>` : '';
 
@@ -429,6 +451,11 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
       </div>
       <h2>Targets (${targets.rowCount})</h2>
       ${targets.rowCount ? `<table><thead><tr><th>Kind</th><th>Name</th><th>Aliases</th><th>Search terms</th></tr></thead><tbody>${targetRows}</tbody></table>` : '<div class="muted">No targets.</div>'}
+
+      <h2>Repeat offenders (last 30 days)</h2>
+      <div class="muted" style="margin-bottom:8px;font-size:12px">Authors with 2+ Tier-2-or-above mentions for this customer. Authors with 3+ get auto-tier-bumped on their next post.</div>
+      ${repeatOffenders.rowCount ? `<table><thead><tr><th>Author</th><th>Source</th><th>Activity</th><th>Last seen</th></tr></thead><tbody>${offenderRows}</tbody></table>` : '<div class="muted">No repeat offenders yet.</div>'}
+
       <h2>Recent mentions (${recent.rowCount})</h2>
       ${recent.rowCount ? `<table><thead><tr><th>Tier</th><th>Target</th><th>Source</th><th>Excerpt</th><th>Posted</th></tr></thead><tbody>${mentionRows}</tbody></table>` : '<div class="muted">No mentions.</div>'}
     `;

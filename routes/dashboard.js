@@ -651,7 +651,8 @@ function build(pool) {
     const whereClause = wheres.length ? 'AND ' + wheres.join(' AND ') : '';
     args.push(limit);
     const q = await pool.query(`
-      SELECT m.id, m.threat_tier, m.source, m.source_url, m.posted_at, m.body_excerpt, m.rationale,
+      SELECT m.id, m.threat_tier, m.tier_bumped, m.original_tier, m.bump_reason,
+             m.source, m.source_url, m.posted_at, m.body_excerpt, m.rationale,
              t.name AS target_name
       FROM mentions m
       LEFT JOIN targets t ON t.id = m.target_id
@@ -681,7 +682,7 @@ function build(pool) {
 
     const rows = q.rows.map(m => `
       <tr>
-        <td>${tierPill(m.threat_tier)}</td>
+        <td>${tierPill(m.threat_tier)}${m.tier_bumped ? ` <span title="Auto-bumped from T${m.original_tier || '?'} (${escapeHtml(m.bump_reason || '')})" style="background:#5e0e16;color:#ff7f7f;padding:1px 5px;border-radius:2px;font-size:9px;font-weight:600;letter-spacing:.05em">BUMP</span>` : ''}</td>
         <td>${escapeHtml(m.target_name || '—')}</td>
         <td>${escapeHtml(m.source)}</td>
         <td>${escapeHtml((m.body_excerpt || '').slice(0, 140))}</td>
@@ -835,10 +836,17 @@ function build(pool) {
     if (!q.rowCount) return res.status(404).send('not found');
     const m = q.rows[0];
 
+    const bumpBanner = m.tier_bumped
+      ? `<div style="background:#3d301a;border-left:3px solid #d8902f;padding:10px 14px;margin:14px 0;font-size:13px">
+           <strong style="color:#d8902f">⚠ Auto-tier-bumped:</strong> classifier originally rated this T${m.original_tier ?? '?'};
+           bumped to T${m.threat_tier} because <code>${escapeHtml(m.bump_reason || '')}</code>.
+           This is the author-watch repeat-offender heuristic.
+         </div>` : '';
     const body = `
       <a href="/dashboard/mentions" class="muted">← all mentions</a>
       <h1 style="margin-top:14px">${tierPill(m.threat_tier)} ${escapeHtml(m.target_name || '—')}</h1>
       <div class="muted">${escapeHtml(TIER_LABELS[m.threat_tier] || '')}</div>
+      ${bumpBanner}
 
       <div class="card" style="margin-top:20px">
         <div class="key-value">

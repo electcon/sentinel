@@ -101,6 +101,18 @@ async function initSchema(pool) {
   await pool.query(`ALTER TABLE mentions ADD COLUMN IF NOT EXISTS review_notes TEXT`);
   await pool.query(`CREATE INDEX IF NOT EXISTS mentions_review_pending ON mentions (customer_id, ingested_at DESC) WHERE review_status = 'pending'`);
 
+  // Author-watch (repeat-offender) tracking. When an author has 3+
+  // Tier-2+ mentions for a customer in the last 30 days, the next
+  // mention from that author gets its tier bumped by 1. tier_bumped
+  // marks that this happened; original_tier preserves the classifier's
+  // pre-bump output for audit.
+  await pool.query(`ALTER TABLE mentions ADD COLUMN IF NOT EXISTS tier_bumped BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE mentions ADD COLUMN IF NOT EXISTS original_tier SMALLINT`);
+  await pool.query(`ALTER TABLE mentions ADD COLUMN IF NOT EXISTS bump_reason TEXT`);
+  // Index for "find recent T2+ mentions by author" lookup. Used in the
+  // repeat-offender heuristic on every ingest.
+  await pool.query(`CREATE INDEX IF NOT EXISTS mentions_author_recent_bad ON mentions (customer_id, author_handle, ingested_at DESC) WHERE threat_tier >= 2`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS threat_events (
       id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
