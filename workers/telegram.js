@@ -139,10 +139,12 @@ async function runOnce({ pool, log = console.log }) {
       for (const { customer, targets } of groups) {
         totalHits++;
         try {
-          // processOne will dedupe via UNIQUE(source, source_id) so the
-          // same post matched against multiple customers will only INSERT
-          // for the FIRST customer's match. To handle multi-customer
-          // properly we'd need a join table; v1 acceptable trade-off.
+          // processOne dedupes via UNIQUE(customer_id, source, source_id),
+          // so the same external post is persisted once per customer
+          // (each customer owns their own row). Updated 2026-04-28 from
+          // the original global UNIQUE(source, source_id) which caused
+          // silent coverage gaps when targets overlapped between
+          // customers.
           const out = await processOne({ pool, customer, targets, item });
           if (out.skipped) totalSkipped++; else totalNew++;
           if (!out.skipped && out.threat_tier >= 3) tier3Plus++;

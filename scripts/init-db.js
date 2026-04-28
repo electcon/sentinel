@@ -79,6 +79,19 @@ async function initSchema(pool) {
   await pool.query(`CREATE INDEX IF NOT EXISTS mentions_customer_time ON mentions (customer_id, posted_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS mentions_target_tier ON mentions (target_id, threat_tier) WHERE threat_tier >= 2`);
 
+  // Mention uniqueness migration. Originally UNIQUE(source, source_id)
+  // — global. Problem: when Customer A and B both monitor "Trump" and
+  // a post matches both, only A gets the row (whoever's worker hits
+  // first); B is silently skipped. Migrate to UNIQUE per customer so
+  // each customer owns their own row for the same external post.
+  // Safe: existing data already satisfies the new constraint (any
+  // (source, source_id) was unique, therefore (customer_id, source,
+  // source_id) is also unique). Idempotent: new index first, then
+  // drop the old constraint by its auto-generated Postgres name.
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS mentions_customer_source_id ON mentions (customer_id, source, source_id)`);
+  // Drop the old global UNIQUE — Postgres auto-named it on table creation.
+  await pool.query(`ALTER TABLE mentions DROP CONSTRAINT IF EXISTS mentions_source_source_id_key`);
+
   // Tier-2 human review queue. Tier 1 = noise (no action), Tier 2 =
   // pending human review per THREAT_TAXONOMY rubric, Tier 3+ = handled
   // via threat_events. review_status is NULL for non-Tier-2 mentions.
