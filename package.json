@@ -22,7 +22,9 @@
     "ingest:cisa": "node workers/cisa.js",
     "alert:run": "node workers/alert.js",
     "digest:run": "node workers/digest.js",
-    "digest:force": "node workers/digest.js --force"
+    "digest:force": "node workers/digest.js --force",
+    "weekly:run": "node workers/weekly.js",
+    "weekly:force": "node workers/weekly.js --force"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.40.0",

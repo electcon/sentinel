@@ -260,6 +260,18 @@ app.get('/api/_smoke/mentions', requireSmokeAdmin, async (req, res) => {
   }
 });
 
+// Trigger one weekly-report sweep. force=true bypasses Sunday-only check.
+app.post('/api/_smoke/weekly-run', requireSmokeAdmin, async (req, res) => {
+  try {
+    const { runOnce } = require('./workers/weekly');
+    const force = !!(req.body && req.body.force);
+    const summary = await runOnce({ pool, log: console.log, force });
+    res.json(summary);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Trigger one digest sweep. Body: { force: true } bypasses the 23h gap.
 // HIGH RISK — sends real email if RESEND_API_KEY set; admin gate.
 app.post('/api/_smoke/digest-run', requireSmokeAdmin, async (req, res) => {
@@ -756,6 +768,7 @@ const SCHEDULES = [
   { name: 'truthsocial',  intervalMs: 10 * 60 * 1000,     startupDelayMs: 130 * 1000, run: () => require('./workers/truthsocial').runOnce({ pool, log: scheduledLog('truthsocial') }) },
   { name: 'cisa',      intervalMs: 60 * 60 * 1000,     startupDelayMs: 240 * 1000, run: () => require('./workers/cisa').runOnce({ pool, log: scheduledLog('cisa') }) },
   { name: 'digest',  intervalMs: 30 * 60 * 1000,     startupDelayMs: 120 * 1000, run: () => require('./workers/digest').runOnce({ pool, log: scheduledLog('digest') }) },
+  { name: 'weekly',  intervalMs:  6 * 60 * 60 * 1000, startupDelayMs: 200 * 1000, run: () => require('./workers/weekly').runOnce({ pool, log: scheduledLog('weekly') }) },
   { name: 'cleanup', intervalMs: 60 * 60 * 1000,     startupDelayMs: 180 * 1000, run: async () => {
       // Prune worker_runs > 7d so the table doesn't grow unbounded.
       const r = await pool.query(`DELETE FROM worker_runs WHERE started_at < NOW() - INTERVAL '7 days'`);
