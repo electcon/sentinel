@@ -9,6 +9,7 @@ const crypto = require('crypto');
 const express = require('express');
 const { hashPassword } = require('../lib/auth');
 const { sendWelcome } = require('../lib/welcome');
+const opAuth = require('../lib/operator-auth');
 
 function escapeHtml(s) {
   return String(s == null ? '' : s)
@@ -30,26 +31,14 @@ function fmtTime(d) {
   return dt.toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
 }
 
-function basicAuthGate(req, res) {
-  const expected = process.env.ADMIN_PASSWORD || '';
-  if (!expected) { res.status(404).send('not found'); return false; }
-  const header = req.headers.authorization || '';
-  if (!header.startsWith('Basic ')) { challenge(res); return false; }
-  let creds;
-  try { creds = Buffer.from(header.slice(6), 'base64').toString('utf8'); } catch (_) { challenge(res); return false; }
-  const [, password] = creds.split(/:(.*)/);
-  if (!password) { challenge(res); return false; }
-  // Constant-time compare.
-  const a = Buffer.from(password); const b = Buffer.from(expected);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) { challenge(res); return false; }
-  return true;
-}
-function challenge(res) {
-  res.set('WWW-Authenticate', 'Basic realm="Sentinel admin"');
-  res.status(401).send('auth required');
-}
+// Auth is now handled by lib/operator-auth.requireOperator (operator
+// session cookie OR bootstrap ADMIN_PASSWORD Basic-auth fallback).
+// The legacy basicAuthGate is preserved here for reference but unused.
 
-function adminPage(title, body) {
+function adminPage(title, body, operator) {
+  const opChip = operator
+    ? `<span style="margin-left:auto;color:#8b949e;font-size:12px">${escapeHtml(operator.name || operator.email || 'bootstrap')}${operator.bootstrap ? ' · <em style="color:#d8902f">bootstrap</em>' : ''} · <a href="/admin/logout" style="color:#4f9af0">log out</a></span>`
+    : '';
   return `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -89,6 +78,8 @@ function adminPage(title, body) {
   <a href="/admin/soc" style="background:#5e0e16;color:#fff;padding:3px 10px;border-radius:3px">SOC</a>
   <a href="/admin/leads">leads</a>
   <a href="/admin/audit">audit</a>
+  <a href="/admin/operators">operators</a>
+  ${opChip}
 </div>
 <div class="container">
 ${body}
@@ -99,23 +90,70 @@ ${body}
 function build(pool) {
   const r = express.Router();
 
-  function gate(req, res, next) {
-    if (!basicAuthGate(req, res)) return;
+  // Hard 404 if neither ADMIN_PASSWORD bootstrap nor a real operator
+  // exists yet — preserves the original "/admin returns 404 unless
+  // configured" behavior.
+  r.use(async function adminGuard(req, res, next) {
+    if (!process.env.ADMIN_PASSWORD) {
+      // Check if at least one operator exists; if not, /admin is 404.
+      try {
+        const c = await pool.query('SELECT 1 FROM operators WHERE active = TRUE LIMIT 1');
+        if (!c.rowCount) return res.status(404).send('not found');
+      } catch (_) { return res.status(404).send('not found'); }
+    }
     next();
-  }
+  });
+
+  // Operator login — public, no auth required.
+  r.get('/admin/login', (req, res) => {
+    const next = req.query.next || '/admin';
+    const err = req.query.err === '1' ? '<div style="background:#5e0e16;color:#fff;padding:10px;margin-bottom:14px;border-radius:4px;text-align:center">Invalid email or password.</div>' : '';
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(`<!doctype html><html><head><meta charset="utf-8"><title>Operator login — Sentinel</title>
+<style>body{margin:0;background:#0a0f1a;color:#e6edf3;font-family:Inter,system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px}
+.card{background:#0e1422;border:1px solid #1c2330;border-radius:8px;padding:32px;width:100%;max-width:400px}
+h1{margin:0 0 24px;font-size:18px;text-align:center;letter-spacing:.06em;color:#ffd56b}
+label{display:block;color:#8b949e;font-size:13px;margin-bottom:5px}
+input{width:100%;background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px 12px;border-radius:4px;font-size:14px;margin-bottom:14px}
+button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-radius:4px;font-size:14px;font-weight:600;cursor:pointer}
+.muted{color:#8b949e;font-size:12px;text-align:center;margin-top:18px}
+</style></head><body><div class="card"><h1>SENTINEL · OPERATOR LOGIN</h1>${err}<form method="POST" action="/admin/login">
+<input type="hidden" name="next" value="${escapeHtml(next)}">
+<label for="email">Email</label><input id="email" name="email" type="email" required autofocus>
+<label for="password">Password</label><input id="password" name="password" type="password" required>
+<button type="submit">Log in</button></form>
+<div class="muted">Operator accounts only. Bootstrap with ADMIN_PASSWORD via Basic auth on first install, then create real operator accounts via <code>scripts/add-operator.js</code>.</div>
+</div></body></html>`);
+  });
+
+  r.post('/admin/login', express.urlencoded({ extended: false }), async (req, res) => {
+    const next = req.body.next || '/admin';
+    const op = await opAuth.authenticate(pool, req.body.email, req.body.password || '');
+    if (!op) return res.redirect(`/admin/login?err=1&next=${encodeURIComponent(next)}`);
+    opAuth.setSessionCookie(res, op.id);
+    res.redirect(next.startsWith('/admin') ? next : '/admin');
+  });
+
+  r.get('/admin/logout', (req, res) => {
+    opAuth.clearSessionCookie(res);
+    res.redirect('/admin/login');
+  });
+
+  // All subsequent /admin routes require an operator (or bootstrap).
+  const gate = opAuth.requireOperator(pool);
 
   // Best-effort audit-log writer. Failures are silent — audit log is
-  // useful but not load-bearing.
+  // useful but not load-bearing. Pulls operator identity from req.operator
+  // (set by lib/operator-auth.requireOperator).
   async function audit(req, action, { targetType = null, targetId = null, details = null } = {}) {
     try {
       const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
-      // Operator identity: Basic-auth username (always 'admin' or '' since we
-      // only check the password). For now actor is constant 'admin'; future
-      // multi-operator setup would parse this from the Basic auth header.
+      const op = req.operator || {};
+      const actor = op.email || op.name || 'unknown';
       await pool.query(`
-        INSERT INTO operator_audit (actor, action, target_type, target_id, details, ip)
-        VALUES ($1, $2, $3, $4, $5::jsonb, $6)
-      `, ['admin', action, targetType, targetId, details ? JSON.stringify(details) : null, ip || null]);
+        INSERT INTO operator_audit (actor, action, target_type, target_id, details, ip, operator_id)
+        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+      `, [actor, action, targetType, targetId, details ? JSON.stringify(details) : null, ip || null, op.id || null]);
     } catch (e) {
       console.error('[audit] write failed:', e.message);
     }
@@ -210,7 +248,7 @@ function build(pool) {
       </table>
     `;
     res.set('Content-Type', 'text/html; charset=utf-8');
-    res.send(adminPage('overview', body));
+    res.send(adminPage('overview', body, req.operator));
   });
 
   // ── /admin/customers ──────────────────────────────────────────────
@@ -254,7 +292,7 @@ function build(pool) {
       </table>
     `;
     res.set('Content-Type', 'text/html; charset=utf-8');
-    res.send(adminPage('customers', body));
+    res.send(adminPage('customers', body, req.operator));
   });
 
   // Per-customer detail (read-only): targets, recent mentions
@@ -323,7 +361,7 @@ function build(pool) {
       ${recent.rowCount ? `<table><thead><tr><th>Tier</th><th>Target</th><th>Source</th><th>Excerpt</th><th>Posted</th></tr></thead><tbody>${mentionRows}</tbody></table>` : '<div class="muted">No mentions.</div>'}
     `;
     res.set('Content-Type', 'text/html; charset=utf-8');
-    res.send(adminPage('customer', body));
+    res.send(adminPage('customer', body, req.operator));
   });
 
   // ── /admin/workers ────────────────────────────────────────────────
@@ -344,7 +382,7 @@ function build(pool) {
     const body = `<h1>Worker runs (last 200)</h1>
       <table><thead><tr><th>Worker</th><th>Status</th><th>Started</th><th>Duration</th><th>Summary / error</th></tr></thead><tbody>${rows}</tbody></table>`;
     res.set('Content-Type', 'text/html; charset=utf-8');
-    res.send(adminPage('workers', body));
+    res.send(adminPage('workers', body, req.operator));
   });
 
   // ── /admin/errors ─────────────────────────────────────────────────
@@ -364,7 +402,7 @@ function build(pool) {
     const body = `<h1>Worker errors (last 100)</h1>
       ${q.rowCount ? `<table><thead><tr><th>Worker</th><th>When</th><th>Duration</th><th>Error</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="muted">No errors logged.</div>'}`;
     res.set('Content-Type', 'text/html; charset=utf-8');
-    res.send(adminPage('errors', body));
+    res.send(adminPage('errors', body, req.operator));
   });
 
   // ── /admin/provision (create or update customer via web form) ────
@@ -450,7 +488,7 @@ function build(pool) {
       </form>
     `;
     res.set('Content-Type', 'text/html; charset=utf-8');
-    res.send(adminPage('Provision customer', body));
+    res.send(adminPage('Provision customer', body, req.operator));
   });
 
   r.post('/admin/provision', gate, express.urlencoded({ extended: false, limit: '256kb' }), async (req, res) => {
@@ -702,7 +740,7 @@ function build(pool) {
       </table>` : '<div class="muted">No feedback yet.</div>'}
     `;
     res.set('Content-Type', 'text/html; charset=utf-8');
-    res.send(adminPage('classifier quality', body));
+    res.send(adminPage('classifier quality', body, req.operator));
   });
 
   // ── /admin/telegram-channels ──────────────────────────────────────
@@ -764,7 +802,7 @@ function build(pool) {
       </form>
     `;
     res.set('Content-Type', 'text/html; charset=utf-8');
-    res.send(adminPage('Telegram channels', body));
+    res.send(adminPage('Telegram channels', body, req.operator));
   });
 
   r.post('/admin/telegram-channels/bulk-add', gate, express.urlencoded({ extended: false, limit: '256kb' }), async (req, res) => {
@@ -835,7 +873,8 @@ function build(pool) {
     // Threat queue: open + reviewing across all customers, T4 first.
     const threats = await pool.query(`
       SELECT te.id, te.tier, te.status, te.created_at, te.alerted_at,
-             te.assignee_ip, te.assignee_taken_at,
+             te.assignee_ip, te.assignee_taken_at, te.assignee_operator_id,
+             op.name AS assignee_name, op.email AS assignee_email,
              m.body_excerpt, m.source, m.source_url, m.author_handle, m.posted_at,
              c.name AS customer_name, c.id AS customer_id,
              t.name AS target_name
@@ -843,6 +882,7 @@ function build(pool) {
       JOIN mentions m ON m.id = te.mention_id
       JOIN customers c ON c.id = te.customer_id
       LEFT JOIN targets t ON t.id = te.target_id
+      LEFT JOIN operators op ON op.id = te.assignee_operator_id
       WHERE te.status IN ('open', 'reviewing')
       ORDER BY te.tier DESC, te.created_at DESC
       LIMIT 60
@@ -906,8 +946,9 @@ function build(pool) {
     const threatCards = threats.rows.length === 0
       ? '<div style="text-align:center;padding:48px;color:#5b6573">No open threats. ☕</div>'
       : threats.rows.map(t => {
-          const taken = !!t.assignee_ip;
-          const mine = t.assignee_ip === ip;
+          const taken = !!(t.assignee_operator_id || t.assignee_ip);
+          const mine = (req.operator?.id && t.assignee_operator_id === req.operator.id) || (!t.assignee_operator_id && t.assignee_ip === ip);
+          const takenByLabel = t.assignee_name || t.assignee_email || (t.assignee_ip || '').slice(0, 16);
           const pulse = t.tier === 4 && t.status === 'open' ? ' soc-pulse' : '';
           return `<div class="soc-card${pulse}" style="background:${tierBg[t.tier] || '#0e1422'};border-color:${tierBorder[t.tier] || '#1c2330'}">
             <div class="soc-card-head">
@@ -922,7 +963,7 @@ function build(pool) {
             <div class="soc-card-body">${escapeHtml((t.body_excerpt || '').slice(0, 280))}</div>
             <div class="soc-card-meta">
               status: <strong>${escapeHtml(t.status)}</strong>
-              ${taken ? ` · taken by <strong>${mine ? 'you' : escapeHtml((t.assignee_ip || '').slice(0, 16))}</strong> ${ago(t.assignee_taken_at)}` : ''}
+              ${taken ? ` · taken by <strong>${mine ? 'you' : escapeHtml(takenByLabel)}</strong> ${ago(t.assignee_taken_at)}` : ''}
               ${t.source_url ? ` · <a href="${escapeHtml(t.source_url)}" target="_blank" rel="noopener">source</a>` : ''}
               · <a href="/admin/customers/${t.customer_id}">customer</a>
             </div>
@@ -1050,10 +1091,18 @@ function build(pool) {
   // actions but operator-side and unified across customers.
   async function _socAction(req, action, newStatus, takeIfNot = false) {
     const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim() || 'unknown';
+    const opId = req.operator?.id || null;
+    const opLabel = req.operator?.email || req.operator?.name || ip;
     const stamp = new Date().toISOString().slice(0, 19).replace('T', ' ') + ' UTC';
-    const note = `[${stamp}] [SOC ${ip}] → ${action}`;
+    const note = `[${stamp}] [SOC ${opLabel}] → ${action}`;
     if (takeIfNot) {
-      await pool.query(`UPDATE threat_events SET assignee_ip = COALESCE(assignee_ip, $2), assignee_taken_at = COALESCE(assignee_taken_at, NOW()) WHERE id = $1`, [req.params.id, ip]);
+      await pool.query(`
+        UPDATE threat_events
+        SET assignee_ip = COALESCE(assignee_ip, $2),
+            assignee_operator_id = COALESCE(assignee_operator_id, $3),
+            assignee_taken_at = COALESCE(assignee_taken_at, NOW())
+        WHERE id = $1
+      `, [req.params.id, ip, opId]);
     }
     await pool.query(`
       UPDATE threat_events
@@ -1066,7 +1115,8 @@ function build(pool) {
 
   r.post('/admin/soc/:id/take', gate, express.urlencoded({ extended: false }), async (req, res) => {
     const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim() || 'unknown';
-    await pool.query(`UPDATE threat_events SET assignee_ip = $2, assignee_taken_at = NOW() WHERE id = $1`, [req.params.id, ip]);
+    const opId = req.operator?.id || null;
+    await pool.query(`UPDATE threat_events SET assignee_ip = $2, assignee_operator_id = $3, assignee_taken_at = NOW() WHERE id = $1`, [req.params.id, ip, opId]);
     await audit(req, 'soc_take', { targetType: 'threat_event', targetId: req.params.id });
     res.redirect('/admin/soc');
   });
@@ -1145,7 +1195,7 @@ function build(pool) {
       </table>` : '<div class="muted" style="margin-top:14px">No leads yet. Form submissions land here automatically.</div>'}
     `;
     res.set('Content-Type', 'text/html; charset=utf-8');
-    res.send(adminPage('leads', body));
+    res.send(adminPage('leads', body, req.operator));
   });
 
   r.post('/admin/leads/:id/status', gate, express.urlencoded({ extended: false }), async (req, res) => {
@@ -1157,6 +1207,83 @@ function build(pool) {
     `, [newStatus, setContactedAt, req.params.id]);
     await audit(req, 'lead_status', { targetType: 'beta_lead', targetId: req.params.id, details: { new_status: newStatus } });
     res.redirect('/admin/leads?ok=Lead+status+updated');
+  });
+
+  // ── /admin/operators ──────────────────────────────────────────────
+  // Operator CRUD. Role is advisory only in v1 (all operators have full
+  // /admin access). Future: enforce viewer-only / analyst-only on
+  // specific routes via req.operator.role.
+  r.get('/admin/operators', gate, async (req, res) => {
+    const flash = req.query.ok ? `<div style="background:#1a4a1a;color:#7fff7f;padding:10px;margin-bottom:14px;border-radius:4px">${escapeHtml(req.query.ok)}</div>` : '';
+    const errFlash = req.query.err ? `<div style="background:#5e0e16;color:#fff;padding:10px;margin-bottom:14px;border-radius:4px">${escapeHtml(req.query.err)}</div>` : '';
+    const q = await pool.query(`
+      SELECT id, email, name, role, active, last_login_at, login_count, created_at
+      FROM operators ORDER BY active DESC, created_at DESC
+    `);
+    const rows = q.rows.map(o => `
+      <tr>
+        <td><strong>${escapeHtml(o.name)}</strong>${req.operator?.id === o.id ? ' <span class="muted" style="font-size:11px">(you)</span>' : ''}</td>
+        <td>${escapeHtml(o.email)}</td>
+        <td><span class="status-pill" style="background:#1a3a5c;color:#cfe5ff">${escapeHtml(o.role)}</span></td>
+        <td>${o.active ? '<span class="pill ok">active</span>' : '<span class="pill" style="background:#3d301a;color:#d8902f">disabled</span>'}</td>
+        <td class="muted">${o.last_login_at ? ago(o.last_login_at) : 'never'}<div class="muted" style="font-size:11px">${o.login_count} logins</div></td>
+        <td class="muted">${fmtTime(o.created_at)}</td>
+        <td>
+          <form method="POST" action="/admin/operators/${o.id}/toggle" style="display:inline">
+            <button type="submit" class="secondary" style="background:#1c2330;color:#e6edf3;border:0;padding:4px 10px;border-radius:3px;cursor:pointer;font-size:11px">${o.active ? 'disable' : 'enable'}</button>
+          </form>
+        </td>
+      </tr>
+    `).join('');
+    const body = `
+      <h1>Operators</h1>
+      <div class="muted">Members of the Sentinel SOC team. Login at <code>/admin/login</code>.</div>
+      ${flash}${errFlash}
+      ${q.rowCount ? `<table style="margin-top:14px">
+        <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th>Last login</th><th>Created</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>` : '<div class="muted" style="margin-top:14px">No operators yet. Bootstrap with <code>node scripts/add-operator.js</code>.</div>'}
+
+      <h2 style="margin-top:32px">Add operator</h2>
+      <form method="POST" action="/admin/operators" style="background:#0e1422;padding:16px;border:1px solid #1c2330;border-radius:6px;max-width:500px">
+        <div style="margin-bottom:10px"><label style="display:block;color:#8b949e;font-size:12px;margin-bottom:4px">Name</label><input type="text" name="name" required style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:8px 10px;border-radius:3px;width:100%;font-size:13px"></div>
+        <div style="margin-bottom:10px"><label style="display:block;color:#8b949e;font-size:12px;margin-bottom:4px">Email</label><input type="email" name="email" required style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:8px 10px;border-radius:3px;width:100%;font-size:13px"></div>
+        <div style="margin-bottom:10px"><label style="display:block;color:#8b949e;font-size:12px;margin-bottom:4px">Initial password (≥ 8 chars)</label><input type="text" name="password" required minlength="8" style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:8px 10px;border-radius:3px;width:100%;font-size:13px;font-family:monospace"></div>
+        <div style="margin-bottom:10px"><label style="display:block;color:#8b949e;font-size:12px;margin-bottom:4px">Role (advisory only in v1)</label><select name="role" style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:8px 10px;border-radius:3px;width:100%;font-size:13px"><option value="analyst">analyst</option><option value="admin">admin</option><option value="viewer">viewer</option></select></div>
+        <button type="submit" style="background:#4f9af0;color:#fff;border:0;padding:8px 14px;border-radius:3px;cursor:pointer">Add</button>
+      </form>
+    `;
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(adminPage('operators', body, req.operator));
+  });
+
+  r.post('/admin/operators', gate, express.urlencoded({ extended: false }), async (req, res) => {
+    const { name, email, password, role } = req.body;
+    if (!name || !email || !password) return res.redirect('/admin/operators?err=All+fields+required');
+    if (password.length < 8) return res.redirect('/admin/operators?err=Password+must+be+%E2%89%A5+8+chars');
+    try {
+      const passwordHash = await opAuth.hashPassword(password);
+      const useRole = ['admin', 'analyst', 'viewer'].includes(role) ? role : 'analyst';
+      const r2 = await pool.query(`
+        INSERT INTO operators (email, name, password_hash, role, active)
+        VALUES ($1, $2, $3, $4, TRUE)
+        ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, password_hash = EXCLUDED.password_hash, role = EXCLUDED.role, active = TRUE
+        RETURNING id, (xmax = 0) AS inserted
+      `, [String(email).toLowerCase().trim(), name, passwordHash, useRole]);
+      await audit(req, r2.rows[0].inserted ? 'operator_create' : 'operator_update', { targetType: 'operator', targetId: r2.rows[0].id, details: { email, role: useRole } });
+      res.redirect('/admin/operators?ok=Operator+saved.+Send+credentials+via+secure+channel.');
+    } catch (e) {
+      res.redirect('/admin/operators?err=' + encodeURIComponent(e.message.slice(0, 100)));
+    }
+  });
+
+  r.post('/admin/operators/:id/toggle', gate, express.urlencoded({ extended: false }), async (req, res) => {
+    if (req.operator?.id === req.params.id) {
+      return res.redirect('/admin/operators?err=Cannot+disable+yourself');
+    }
+    await pool.query(`UPDATE operators SET active = NOT active WHERE id = $1`, [req.params.id]);
+    await audit(req, 'operator_toggle', { targetType: 'operator', targetId: req.params.id });
+    res.redirect('/admin/operators?ok=Operator+toggled');
   });
 
   // ── /admin/audit ──────────────────────────────────────────────────
@@ -1188,7 +1315,7 @@ function build(pool) {
       </table>` : '<div class="muted" style="margin-top:14px">No actions logged yet.</div>'}
     `;
     res.set('Content-Type', 'text/html; charset=utf-8');
-    res.send(adminPage('audit', body));
+    res.send(adminPage('audit', body, req.operator));
   });
 
   // ── /admin/threats ────────────────────────────────────────────────
@@ -1217,7 +1344,7 @@ function build(pool) {
     const body = `<h1>All threat events (last 100)</h1>
       ${q.rowCount ? `<table><thead><tr><th>Tier</th><th>Customer</th><th>Target</th><th>Source</th><th>Excerpt</th><th>Status</th><th>Detected</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="muted">No threat events.</div>'}`;
     res.set('Content-Type', 'text/html; charset=utf-8');
-    res.send(adminPage('threats', body));
+    res.send(adminPage('threats', body, req.operator));
   });
 
   return r;

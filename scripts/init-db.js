@@ -222,6 +222,29 @@ async function initSchema(pool) {
   await pool.query(`CREATE INDEX IF NOT EXISTS operator_audit_recent ON operator_audit (created_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS operator_audit_target ON operator_audit (target_type, target_id, created_at DESC)`);
 
+  // Multi-operator auth. Replaces single-shared ADMIN_PASSWORD as the
+  // canonical operator identity. ADMIN_PASSWORD Basic auth remains as
+  // a bootstrap-only fallback in routes/admin.js so the user isn't
+  // locked out before creating their first operator account.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS operators (
+      id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      email           TEXT UNIQUE NOT NULL,
+      name            TEXT NOT NULL,
+      password_hash   TEXT NOT NULL,
+      role            TEXT NOT NULL DEFAULT 'analyst',  -- 'admin' | 'analyst' | 'viewer'
+      active          BOOLEAN NOT NULL DEFAULT TRUE,
+      last_login_at   TIMESTAMPTZ,
+      login_count     INTEGER NOT NULL DEFAULT 0,
+      created_at      TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS operators_active_email ON operators (email) WHERE active = TRUE`);
+
+  // Wire operator identity into existing tables (best-effort, idempotent).
+  await pool.query(`ALTER TABLE operator_audit ADD COLUMN IF NOT EXISTS operator_id UUID REFERENCES operators(id)`);
+  await pool.query(`ALTER TABLE threat_events ADD COLUMN IF NOT EXISTS assignee_operator_id UUID REFERENCES operators(id)`);
+
   // Beta-access lead form (public landing-page submissions). Operator
   // contacts these manually to qualify and provision via /admin/provision.
   await pool.query(`
