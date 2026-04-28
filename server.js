@@ -845,9 +845,23 @@ const SCHEDULES = [
   { name: 'digest',  intervalMs: 30 * 60 * 1000,     startupDelayMs: 120 * 1000, run: () => require('./workers/digest').runOnce({ pool, log: scheduledLog('digest') }) },
   { name: 'weekly',  intervalMs:  6 * 60 * 60 * 1000, startupDelayMs: 200 * 1000, run: () => require('./workers/weekly').runOnce({ pool, log: scheduledLog('weekly') }) },
   { name: 'cleanup', intervalMs: 60 * 60 * 1000,     startupDelayMs: 180 * 1000, run: async () => {
-      // Prune worker_runs > 7d so the table doesn't grow unbounded.
-      const r = await pool.query(`DELETE FROM worker_runs WHERE started_at < NOW() - INTERVAL '7 days'`);
-      return { deleted: r.rowCount };
+      // Multi-table retention sweep, runs every hour.
+      const out = {};
+      const r1 = await pool.query(`DELETE FROM worker_runs WHERE started_at < NOW() - INTERVAL '7 days'`);
+      out.worker_runs = r1.rowCount;
+      const r2 = await pool.query(`DELETE FROM operator_audit WHERE created_at < NOW() - INTERVAL '365 days'`);
+      out.operator_audit = r2.rowCount;
+      const r3 = await pool.query(`DELETE FROM classifier_feedback WHERE created_at < NOW() - INTERVAL '365 days'`);
+      out.classifier_feedback = r3.rowCount;
+      // CISA AIS TLP rules: don't keep cyber indicators forever. 30 days
+      // is conservative; bump if the customer-side cross-referencing
+      // ever needs longer history.
+      const r4 = await pool.query(`DELETE FROM cyber_indicators WHERE last_seen_at < NOW() - INTERVAL '30 days'`);
+      out.cyber_indicators = r4.rowCount;
+      // Spam leads: drop after 90 days. Real leads stay forever.
+      const r5 = await pool.query(`DELETE FROM beta_leads WHERE status = 'spam' AND created_at < NOW() - INTERVAL '90 days'`);
+      out.beta_leads_spam = r5.rowCount;
+      return out;
     }
   }
 ];
