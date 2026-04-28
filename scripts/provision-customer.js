@@ -68,14 +68,14 @@ async function main() {
     customerId = existing.rows[0].id;
     await pool.query(`
       UPDATE customers
-      SET contact_email = $2, alert_email = $3, digest_email = $4, status = $5, password_hash = $6
+      SET contact_email = $2, alert_email = $3, digest_email = $4, status = $5, password_hash = $6, must_change_password = TRUE
       WHERE id = $1
     `, [customerId, spec.contact_email, spec.alert_email, spec.digest_email, spec.status || 'beta', passwordHash]);
     console.log('[provision] customer updated:', customerId);
   } else {
     const ins = await pool.query(`
-      INSERT INTO customers (name, contact_email, alert_email, digest_email, status, password_hash)
-      VALUES ($1, $2, $3, $4, $5, $6)
+      INSERT INTO customers (name, contact_email, alert_email, digest_email, status, password_hash, must_change_password)
+      VALUES ($1, $2, $3, $4, $5, $6, TRUE)
       RETURNING id
     `, [spec.name, spec.contact_email, spec.alert_email, spec.digest_email, spec.status || 'beta', passwordHash]);
     customerId = ins.rows[0].id;

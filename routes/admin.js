@@ -706,10 +706,13 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
       let customerId;
       if (existing.rowCount > 0) {
         customerId = existing.rows[0].id;
-        await pool.query(`UPDATE customers SET contact_email=$2, alert_email=$3, digest_email=$4, status=$5, password_hash=$6, state=$7 WHERE id=$1`,
+        // Operator-typed passwords are always temporary — set the
+        // must_change_password flag so the customer is forced to
+        // pick their own on next login.
+        await pool.query(`UPDATE customers SET contact_email=$2, alert_email=$3, digest_email=$4, status=$5, password_hash=$6, state=$7, must_change_password=TRUE WHERE id=$1`,
           [customerId, contact_email, alert_email, digest_email, useStatus, passwordHash, useState]);
       } else {
-        const ins = await pool.query(`INSERT INTO customers (name, contact_email, alert_email, digest_email, status, password_hash, state) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+        const ins = await pool.query(`INSERT INTO customers (name, contact_email, alert_email, digest_email, status, password_hash, state, must_change_password) VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE) RETURNING id`,
           [name, contact_email, alert_email, digest_email, useStatus, passwordHash, useState]);
         customerId = ins.rows[0].id;
       }

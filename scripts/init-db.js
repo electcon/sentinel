@@ -40,6 +40,9 @@ async function initSchema(pool) {
   await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT`);
   await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT`);
   await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS billing_notes TEXT`);
+  // Force first-login password change. Set on provision; cleared on
+  // first successful self-set in /dashboard/settings/password.
+  await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`CREATE INDEX IF NOT EXISTS customers_billing_status ON customers (billing_status) WHERE billing_status NOT IN ('free_beta', 'canceled')`);
 
   await pool.query(`

@@ -1166,6 +1166,43 @@ ${reviewRows}
     res.send(layout({ title: 'Mention', customer: req.customer, body, active: 'mentions' }));
   });
 
+  // ── Forced password change on first login ─────────────────────────
+  // If customer.must_change_password is true, the auth middleware
+  // redirects every authed route here until the customer sets their
+  // own password.
+  r.get('/dashboard/force-password-change', authed, (req, res) => {
+    const err = req.query.err === '1' ? '<div style="background:#5e0e16;color:#fff;padding:10px;margin-bottom:14px;border-radius:4px">Passwords don\'t match or are too short.</div>' : '';
+    const body = `
+      <div style="max-width:480px;margin:48px auto">
+        <h1>Pick a new password</h1>
+        <p class="muted" style="margin-bottom:18px">For security, please replace the temporary password your Sentinel rep set for you. Pick something you'll remember; we don't store it in plaintext.</p>
+        ${err}
+        <form method="POST" action="/dashboard/force-password-change/save">
+          <div class="field">
+            <label for="new_password">New password (≥ 8 chars)</label>
+            <input id="new_password" name="new_password" type="password" required minlength="8" autofocus>
+          </div>
+          <div class="field">
+            <label for="confirm_password">Confirm</label>
+            <input id="confirm_password" name="confirm_password" type="password" required minlength="8">
+          </div>
+          <button type="submit">Save and continue</button>
+        </form>
+      </div>`;
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(layout({ title: 'Set your password', customer: req.customer, body, active: 'settings' }));
+  });
+
+  r.post('/dashboard/force-password-change/save', authed, express.urlencoded({ extended: false }), async (req, res) => {
+    const next = req.body.new_password || '';
+    const confirm = req.body.confirm_password || '';
+    if (!next || next !== confirm) return res.redirect('/dashboard/force-password-change?err=1');
+    if (next.length < 8) return res.redirect('/dashboard/force-password-change?err=1');
+    const hash = await hashPassword(next);
+    await pool.query(`UPDATE customers SET password_hash = $1, must_change_password = FALSE WHERE id = $2`, [hash, req.customer.id]);
+    res.redirect('/dashboard?ok=1');
+  });
+
   // ── Billing routes (customer-side) ────────────────────────────────
   // After Stripe Checkout returns. ?status=success means the
   // subscription was created (webhook will flip billing_status when it
@@ -1578,7 +1615,7 @@ ${reviewRows}
     const ok = await verifyPassword(cur, q.rows[0]?.password_hash || '');
     if (!ok) return res.redirect('/dashboard/settings?err=Current+password+wrong');
     const hash = await hashPassword(next);
-    await pool.query('UPDATE customers SET password_hash = $1 WHERE id = $2', [hash, req.customer.id]);
+    await pool.query('UPDATE customers SET password_hash = $1, must_change_password = FALSE WHERE id = $2', [hash, req.customer.id]);
     res.redirect('/dashboard/settings?ok=Password+changed');
   });
 
