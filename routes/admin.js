@@ -86,6 +86,7 @@ function adminPage(title, body) {
   <a href="/admin/threats">threats</a>
   <a href="/admin/classifier-quality">classifier</a>
   <a href="/admin/telegram-channels">telegram</a>
+  <a href="/admin/soc" style="background:#5e0e16;color:#fff;padding:3px 10px;border-radius:3px">SOC</a>
   <a href="/admin/leads">leads</a>
   <a href="/admin/audit">audit</a>
 </div>
@@ -822,6 +823,267 @@ function build(pool) {
     await pool.query(`DELETE FROM monitored_channels WHERE id = $1 AND source = 'telegram'`, [req.params.id]);
     await audit(req, 'delete', { targetType: 'monitored_channel', targetId: req.params.id, details: { channel_id: before.rows[0]?.channel_id } });
     res.redirect('/admin/telegram-channels?ok=Deleted');
+  });
+
+  // ── /admin/soc — Operations Center ────────────────────────────────
+  // Wall-display-friendly multi-customer threat queue. Auto-refresh
+  // every 30s. Inline ack/dismiss/escalate buttons. Audio cue on
+  // first-load when new T3+ has landed since last seen (cookie-tracked).
+  r.get('/admin/soc', gate, async (req, res) => {
+    const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim() || 'unknown';
+
+    // Threat queue: open + reviewing across all customers, T4 first.
+    const threats = await pool.query(`
+      SELECT te.id, te.tier, te.status, te.created_at, te.alerted_at,
+             te.assignee_ip, te.assignee_taken_at,
+             m.body_excerpt, m.source, m.source_url, m.author_handle, m.posted_at,
+             c.name AS customer_name, c.id AS customer_id,
+             t.name AS target_name
+      FROM threat_events te
+      JOIN mentions m ON m.id = te.mention_id
+      JOIN customers c ON c.id = te.customer_id
+      LEFT JOIN targets t ON t.id = te.target_id
+      WHERE te.status IN ('open', 'reviewing')
+      ORDER BY te.tier DESC, te.created_at DESC
+      LIMIT 60
+    `);
+
+    // Top-bar counters — across-all-customers state.
+    const counters = await pool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE te.tier = 4 AND te.status = 'open')::int AS t4_open,
+        COUNT(*) FILTER (WHERE te.tier = 3 AND te.status = 'open')::int AS t3_open,
+        COUNT(*) FILTER (WHERE te.status = 'reviewing')::int AS reviewing,
+        (SELECT COUNT(*)::int FROM mentions WHERE review_status = 'pending') AS t2_pending,
+        (SELECT COUNT(*)::int FROM mentions WHERE ingested_at > NOW() - INTERVAL '1 hour') AS mentions_1h
+      FROM threat_events te
+    `);
+    const c = counters.rows[0];
+
+    // Activity feed: last 30 events of any kind.
+    const feed = await pool.query(`
+      (
+        SELECT 'threat' AS kind, te.created_at AS at, te.tier, te.status,
+               t.name AS target, cu.name AS customer, m.source, m.body_excerpt
+        FROM threat_events te
+        JOIN mentions m ON m.id = te.mention_id
+        JOIN customers cu ON cu.id = te.customer_id
+        LEFT JOIN targets t ON t.id = te.target_id
+        ORDER BY te.created_at DESC LIMIT 20
+      )
+      UNION ALL
+      (
+        SELECT 'worker_err' AS kind, started_at AS at, NULL::int AS tier, NULL::text AS status,
+               worker_name AS target, NULL AS customer, worker_name AS source, error AS body_excerpt
+        FROM worker_runs
+        WHERE NOT ok AND started_at > NOW() - INTERVAL '6 hours'
+        ORDER BY started_at DESC LIMIT 10
+      )
+      ORDER BY at DESC LIMIT 30
+    `);
+
+    // New-T3+-since-last-load detection. Cookie tracks the latest seen
+    // threat_event id; if the current top T3+ id is different, we
+    // tell the page to play the alert tone on load.
+    const latestT3Plus = threats.rows.find(r2 => r2.tier >= 3);
+    const lastSeen = req.cookies?.soc_last_seen || (req.headers.cookie || '').match(/soc_last_seen=([^;]+)/)?.[1] || '';
+    const playAlert = latestT3Plus && lastSeen !== latestT3Plus.id;
+    if (latestT3Plus) {
+      const isProd = process.env.NODE_ENV === 'production';
+      res.append('Set-Cookie', `soc_last_seen=${encodeURIComponent(latestT3Plus.id)}; Path=/admin/soc; HttpOnly; SameSite=Lax${isProd ? '; Secure' : ''}; Max-Age=86400`);
+    }
+
+    const tierColor = { 4: '#7a1019', 3: '#a04400', 2: '#7a4a0a', 1: '#5b6573' };
+    const tierBg = { 4: '#1a0608', 3: '#1a0c00', 2: '#0e1422', 1: '#0e1422' };
+    const tierBorder = { 4: '#a82a2a', 3: '#d8902f', 2: '#5b6573', 1: '#1c2330' };
+
+    const fmtTimeShort = (d) => {
+      if (!d) return '—';
+      const dt = d instanceof Date ? d : new Date(d);
+      return dt.toISOString().slice(11, 16) + 'Z';
+    };
+
+    const threatCards = threats.rows.length === 0
+      ? '<div style="text-align:center;padding:48px;color:#5b6573">No open threats. ☕</div>'
+      : threats.rows.map(t => {
+          const taken = !!t.assignee_ip;
+          const mine = t.assignee_ip === ip;
+          const pulse = t.tier === 4 && t.status === 'open' ? ' soc-pulse' : '';
+          return `<div class="soc-card${pulse}" style="background:${tierBg[t.tier] || '#0e1422'};border-color:${tierBorder[t.tier] || '#1c2330'}">
+            <div class="soc-card-head">
+              <span class="tier-pill" style="background:${tierColor[t.tier]};color:#fff">T${t.tier}</span>
+              <strong>${escapeHtml(t.target_name || '—')}</strong>
+              <span class="muted">·</span>
+              <span class="muted">${escapeHtml(t.customer_name)}</span>
+              <span class="muted">·</span>
+              <span class="muted">${escapeHtml(t.source)}${t.author_handle ? ' · @' + escapeHtml(t.author_handle) : ''}</span>
+              <span class="soc-age">${ago(t.created_at)}</span>
+            </div>
+            <div class="soc-card-body">${escapeHtml((t.body_excerpt || '').slice(0, 280))}</div>
+            <div class="soc-card-meta">
+              status: <strong>${escapeHtml(t.status)}</strong>
+              ${taken ? ` · taken by <strong>${mine ? 'you' : escapeHtml((t.assignee_ip || '').slice(0, 16))}</strong> ${ago(t.assignee_taken_at)}` : ''}
+              ${t.source_url ? ` · <a href="${escapeHtml(t.source_url)}" target="_blank" rel="noopener">source</a>` : ''}
+              · <a href="/admin/customers/${t.customer_id}">customer</a>
+            </div>
+            <div class="soc-actions">
+              ${!taken ? `<form method="POST" action="/admin/soc/${t.id}/take" style="display:inline"><button class="btn-take" type="submit">Take</button></form>` : ''}
+              <form method="POST" action="/admin/soc/${t.id}/ack" style="display:inline"><button class="btn-ack" type="submit">Ack (reviewing)</button></form>
+              <form method="POST" action="/admin/soc/${t.id}/dismiss" style="display:inline"><button class="btn-dismiss" type="submit">Dismiss</button></form>
+              <form method="POST" action="/admin/soc/${t.id}/escalate-le" style="display:inline"><button class="btn-le" type="submit">→ Law enf</button></form>
+            </div>
+          </div>`;
+        }).join('');
+
+    const feedItems = feed.rows.map(f => {
+      const time = fmtTimeShort(f.at);
+      if (f.kind === 'threat') {
+        const c2 = f.tier ? tierColor[f.tier] : '#5b6573';
+        return `<div class="feed-row"><span class="feed-time">${time}</span><span class="tier-pill" style="background:${c2};color:#fff">T${f.tier}</span> <strong>${escapeHtml(f.target || '—')}</strong> <span class="muted">${escapeHtml(f.customer || '')} · ${escapeHtml(f.source || '')}</span><div class="feed-excerpt">${escapeHtml((f.body_excerpt || '').slice(0, 100))}</div></div>`;
+      } else {
+        return `<div class="feed-row feed-err"><span class="feed-time">${time}</span><span class="tier-pill" style="background:#5e0e16;color:#fff">ERR</span> <strong>${escapeHtml(f.target)}</strong><div class="feed-excerpt">${escapeHtml((f.body_excerpt || '').slice(0, 120))}</div></div>`;
+      }
+    }).join('');
+
+    const css = `
+      *{box-sizing:border-box;margin:0;padding:0}
+      body{font-family:Inter,system-ui,-apple-system,sans-serif;background:#050810;color:#e6edf3;font-size:14px;line-height:1.4}
+      .topbar{background:linear-gradient(180deg,#0e1422 0%, #050810 100%);border-bottom:1px solid #2a2c40;padding:14px 24px;display:flex;align-items:center;gap:24px;position:sticky;top:0;z-index:10}
+      .topbar .brand{font-weight:700;letter-spacing:.08em;color:#ffd56b;font-size:16px}
+      .counter{display:flex;flex-direction:column;align-items:center}
+      .counter .n{font-size:24px;font-weight:700;line-height:1}
+      .counter .lbl{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:#8b949e;margin-top:4px}
+      .counter.t4 .n{color:#ff7080}
+      .counter.t3 .n{color:#e57e3a}
+      .counter.t2 .n{color:#d8902f}
+      .counter.review .n{color:#7fff7f}
+      .topbar .right{margin-left:auto;font-size:12px;color:#8b949e;text-align:right}
+      .layout{display:grid;grid-template-columns:1fr 360px;gap:0;height:calc(100vh - 60px)}
+      .queue{padding:18px 24px;overflow-y:auto;border-right:1px solid #1c2330}
+      .feed{padding:14px 18px;overflow-y:auto;background:#0a0d18}
+      .queue h2,.feed h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#8b949e;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+      .live-dot{width:8px;height:8px;border-radius:50%;background:#3a9c3a;animation:livepulse 2s infinite}
+      @keyframes livepulse{0%,100%{opacity:1}50%{opacity:.3}}
+      .soc-card{background:#0e1422;border:1px solid #1c2330;border-radius:6px;padding:12px 14px;margin-bottom:10px}
+      .soc-card-head{display:flex;align-items:center;gap:8px;font-size:13px;flex-wrap:wrap}
+      .soc-card-body{padding:8px 0;color:#cdd5e0;font-size:14px;line-height:1.5}
+      .soc-card-meta{font-size:11px;color:#8b949e;margin-bottom:8px}
+      .soc-card-meta a{color:#4f9af0}
+      .soc-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+      .soc-actions button{font-size:11px;font-weight:600;padding:5px 10px;border:0;border-radius:3px;cursor:pointer;color:#fff;font-family:inherit}
+      .btn-take{background:#1a4a1a}
+      .btn-ack{background:#2a5a8c}
+      .btn-dismiss{background:#3d301a}
+      .btn-le{background:#7a1019}
+      .tier-pill{display:inline-block;padding:2px 7px;border-radius:3px;font-size:10px;font-weight:700;letter-spacing:.05em}
+      .soc-age{margin-left:auto;color:#5b6573;font-size:11px}
+      .muted{color:#8b949e;font-size:12px}
+      .soc-pulse{animation:tier4pulse 1.6s infinite}
+      @keyframes tier4pulse{0%,100%{box-shadow:0 0 0 0 rgba(255,112,128,.0)}50%{box-shadow:0 0 0 4px rgba(255,112,128,.4)}}
+      .feed-row{padding:6px 0;border-bottom:1px solid #1c2330;font-size:12px}
+      .feed-row:last-child{border-bottom:0}
+      .feed-time{color:#5b6573;font-family:'SF Mono',Monaco,monospace;margin-right:6px}
+      .feed-excerpt{color:#5b6573;font-size:11px;margin-top:2px;padding-left:32px}
+      .feed-err .tier-pill{background:#5e0e16}
+    `;
+
+    const js = `
+      // 30s auto-refresh keeps the page live without WebSockets.
+      setTimeout(function(){ location.reload(); }, 30000);
+      // Audio alert on new T3+ (only if cookie didn't match prior latest).
+      ${playAlert ? `
+        (function(){
+          try {
+            var ctx = new (window.AudioContext || window.webkitAudioContext)();
+            var o = ctx.createOscillator();
+            var g = ctx.createGain();
+            o.type = 'sine'; o.frequency.value = 880;
+            g.gain.setValueAtTime(0.3, ctx.currentTime);
+            g.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.5);
+            o.connect(g); g.connect(ctx.destination);
+            o.start(); o.stop(ctx.currentTime + 0.5);
+          } catch(e){}
+        })();
+      ` : ''}
+    `;
+
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    // Relax CSP for this page so the inline audio script can run.
+    // Only this route needs the unsafe-inline; the rest of the app keeps strict CSP.
+    res.set('Content-Security-Policy',
+      "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'");
+    res.send(`<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SOC — Sentinel</title>
+<style>${css}</style>
+</head><body>
+<div class="topbar">
+  <div class="brand">SENTINEL · SOC</div>
+  <div class="counter t4"><div class="n">${c.t4_open}</div><div class="lbl">T4 open</div></div>
+  <div class="counter t3"><div class="n">${c.t3_open}</div><div class="lbl">T3 open</div></div>
+  <div class="counter review"><div class="n">${c.reviewing}</div><div class="lbl">Reviewing</div></div>
+  <div class="counter t2"><div class="n">${c.t2_pending}</div><div class="lbl">T2 queue</div></div>
+  <div class="counter"><div class="n" style="color:#cdd5e0">${c.mentions_1h}</div><div class="lbl">Mentions 1h</div></div>
+  <div class="right">
+    <div><span class="live-dot"></span> live · auto-refresh 30s</div>
+    <div style="margin-top:2px;font-family:monospace">operator: ${escapeHtml(ip.slice(0, 16))}</div>
+  </div>
+</div>
+
+<div class="layout">
+  <div class="queue">
+    <h2><span class="live-dot"></span> Active threat queue (${threats.rowCount})</h2>
+    ${threatCards}
+  </div>
+  <div class="feed">
+    <h2><span class="live-dot"></span> Activity feed</h2>
+    ${feedItems}
+  </div>
+</div>
+
+<script>${js}</script>
+</body></html>`);
+  });
+
+  // SOC inline action handlers — write threat-event status updates +
+  // append audit notes. Same shape as the customer-side dashboard
+  // actions but operator-side and unified across customers.
+  async function _socAction(req, action, newStatus, takeIfNot = false) {
+    const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim() || 'unknown';
+    const stamp = new Date().toISOString().slice(0, 19).replace('T', ' ') + ' UTC';
+    const note = `[${stamp}] [SOC ${ip}] → ${action}`;
+    if (takeIfNot) {
+      await pool.query(`UPDATE threat_events SET assignee_ip = COALESCE(assignee_ip, $2), assignee_taken_at = COALESCE(assignee_taken_at, NOW()) WHERE id = $1`, [req.params.id, ip]);
+    }
+    await pool.query(`
+      UPDATE threat_events
+      SET status = $2,
+          resolved_at = CASE WHEN $3::boolean THEN NOW() ELSE resolved_at END,
+          notes = CASE WHEN notes IS NULL OR notes = '' THEN $4 ELSE notes || E'\\n' || $4 END
+      WHERE id = $1
+    `, [req.params.id, newStatus, ['dismissed', 'reported_law_enf', 'monitoring'].includes(newStatus), note]);
+  }
+
+  r.post('/admin/soc/:id/take', gate, express.urlencoded({ extended: false }), async (req, res) => {
+    const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim() || 'unknown';
+    await pool.query(`UPDATE threat_events SET assignee_ip = $2, assignee_taken_at = NOW() WHERE id = $1`, [req.params.id, ip]);
+    await audit(req, 'soc_take', { targetType: 'threat_event', targetId: req.params.id });
+    res.redirect('/admin/soc');
+  });
+  r.post('/admin/soc/:id/ack', gate, express.urlencoded({ extended: false }), async (req, res) => {
+    await _socAction(req, 'ack', 'reviewing', true);
+    await audit(req, 'soc_ack', { targetType: 'threat_event', targetId: req.params.id });
+    res.redirect('/admin/soc');
+  });
+  r.post('/admin/soc/:id/dismiss', gate, express.urlencoded({ extended: false }), async (req, res) => {
+    await _socAction(req, 'dismiss', 'dismissed', true);
+    await audit(req, 'soc_dismiss', { targetType: 'threat_event', targetId: req.params.id });
+    res.redirect('/admin/soc');
+  });
+  r.post('/admin/soc/:id/escalate-le', gate, express.urlencoded({ extended: false }), async (req, res) => {
+    await _socAction(req, 'escalate-LE', 'reported_law_enf', true);
+    await audit(req, 'soc_le_escalate', { targetType: 'threat_event', targetId: req.params.id });
+    res.redirect('/admin/soc');
   });
 
   // ── /admin/leads ──────────────────────────────────────────────────

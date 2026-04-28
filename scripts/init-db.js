@@ -92,6 +92,11 @@ async function initSchema(pool) {
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS threat_events_open ON threat_events (customer_id, tier DESC, created_at DESC) WHERE status NOT IN ('dismissed', 'reported_law_enf', 'monitoring')`);
+  await pool.query(`ALTER TABLE threat_events ADD COLUMN IF NOT EXISTS assignee_ip TEXT`);
+  await pool.query(`ALTER TABLE threat_events ADD COLUMN IF NOT EXISTS assignee_taken_at TIMESTAMPTZ`);
+  // Cross-customer SOC index — open + reviewing across everything,
+  // sorted by tier desc.
+  await pool.query(`CREATE INDEX IF NOT EXISTS threat_events_soc ON threat_events (tier DESC, created_at DESC) WHERE status IN ('open', 'reviewing')`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS classifications (
