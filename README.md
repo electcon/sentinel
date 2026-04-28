@@ -164,6 +164,10 @@ Optional / per-source:
 - `TELEGRAM_STALE_THRESHOLD` (default 5 — auto-pause channel after N empty/error fetches)
 - `SMOKE_DISABLED=true` — kill switch: all `/api/_smoke/*` routes return 404. Set once real customers are onboarded.
 - `TRUTHSOCIAL_ACCESS_TOKEN` — see `TRUTHSOCIAL_ONBOARDING.md`; worker dormant until set
+- `STRIPE_SECRET_KEY` — `sk_live_...` or `sk_test_...`. Without it, all Stripe features 503 / hide.
+- `STRIPE_PUBLISHABLE_KEY` — `pk_live_...` or `pk_test_...`. Currently unused server-side (Checkout is server-driven), but recommended for future client-side flows.
+- `STRIPE_WEBHOOK_SECRET` — `whsec_...`. Required for `/api/stripe-webhook` signature verification. Get this from Stripe dashboard when you create the webhook endpoint.
+- `STRIPE_BETA_PRICE_USD` (default 500), `STRIPE_BETA_PRICE_INTERVAL` ('month' default; 'year' valid) — controls the auto-created Sentinel Beta product/price.
 
 ## Tests
 

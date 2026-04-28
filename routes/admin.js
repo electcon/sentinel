@@ -10,6 +10,7 @@ const express = require('express');
 const { hashPassword } = require('../lib/auth');
 const { sendWelcome } = require('../lib/welcome');
 const opAuth = require('../lib/operator-auth');
+const stripeClient = require('../lib/stripe-client');
 
 function escapeHtml(s) {
   return String(s == null ? '' : s)
@@ -363,7 +364,14 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
       ${riskPanel}
 
       <div class="card" style="margin-top:14px">
-        <div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Billing</div>
+        <div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Billing${stripeClient.isConfigured() ? ` <span style="background:${stripeClient.getMode() === 'live' ? '#5e0e16' : '#1a4a1a'};color:#fff;padding:1px 6px;border-radius:3px;margin-left:6px;font-size:10px">stripe ${stripeClient.getMode() || 'unknown'}</span>` : ' <span style="color:#d8902f">· stripe not configured</span>'}</div>
+        ${stripeClient.isConfigured() ? `<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+          ${!cust.stripe_customer_id
+            ? `<form method="POST" action="/admin/customers/${cust.id}/stripe-create-customer" style="display:inline"><button type="submit" class="secondary" style="background:#1a4a1a;color:#7fff7f;border:0;padding:6px 12px;border-radius:3px;cursor:pointer;font-size:12px">+ Create Stripe customer</button></form>`
+            : `<form method="POST" action="/admin/customers/${cust.id}/stripe-checkout" style="display:inline"><button type="submit" style="background:#4f9af0;color:#fff;border:0;padding:6px 12px;border-radius:3px;cursor:pointer;font-size:12px">→ Send checkout link</button></form>
+               <a href="https://dashboard.stripe.com/${stripeClient.getMode() === 'test' ? 'test/' : ''}customers/${escapeHtml(cust.stripe_customer_id)}" target="_blank" rel="noopener" style="background:#1c2330;color:#e6edf3;padding:6px 12px;border-radius:3px;text-decoration:none;font-size:12px">Stripe dashboard ↗</a>`
+          }
+        </div>` : ''}
         <div style="display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:14px;margin-bottom:10px">
           <div class="muted">status</div><div>${(() => {
             const colors = { free_beta: ['#1a3a5c', '#cfe5ff'], trialing: ['#3d301a', '#d8902f'], active: ['#1a4a1a', '#7fff7f'], past_due: ['#5e0e16', '#ff7f7f'], canceled: ['#1c2330', '#8b949e'] };
@@ -426,6 +434,48 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
     `;
     res.set('Content-Type', 'text/html; charset=utf-8');
     res.send(adminPage('customer', body, req.operator));
+  });
+
+  // Stripe action: create a Stripe Customer for this Sentinel customer.
+  // Idempotent (looks up existing). Persists stripe_customer_id.
+  r.post('/admin/customers/:id/stripe-create-customer', gate, express.urlencoded({ extended: false }), async (req, res) => {
+    if (!stripeClient.isConfigured()) return res.redirect(`/admin/customers/${req.params.id}?err=Stripe+not+configured`);
+    try {
+      const c = await pool.query('SELECT id, name, contact_email, stripe_customer_id FROM customers WHERE id = $1', [req.params.id]);
+      if (!c.rowCount) return res.status(404).send('not found');
+      const sc = await stripeClient.getOrCreateStripeCustomer(c.rows[0]);
+      await pool.query(`UPDATE customers SET stripe_customer_id = $1 WHERE id = $2`, [sc.id, req.params.id]);
+      await audit(req, 'stripe_customer_create', { targetType: 'customer', targetId: req.params.id, details: { stripe_customer_id: sc.id, mode: stripeClient.getMode() } });
+      res.redirect(`/admin/customers/${req.params.id}?ok=Stripe+customer+created+${encodeURIComponent(sc.id)}`);
+    } catch (e) {
+      res.redirect(`/admin/customers/${req.params.id}?err=Stripe+error%3A+${encodeURIComponent(e.message.slice(0, 100))}`);
+    }
+  });
+
+  // Stripe action: create a Checkout Session for the monthly subscription.
+  // Returns a URL the operator can copy + email to the customer.
+  r.post('/admin/customers/:id/stripe-checkout', gate, express.urlencoded({ extended: false }), async (req, res) => {
+    if (!stripeClient.isConfigured()) return res.redirect(`/admin/customers/${req.params.id}?err=Stripe+not+configured`);
+    try {
+      const c = await pool.query('SELECT id, name, contact_email, stripe_customer_id FROM customers WHERE id = $1', [req.params.id]);
+      if (!c.rowCount) return res.status(404).send('not found');
+      const baseUrl = process.env.DASHBOARD_BASE_URL || 'https://sentinel.parallaxadvisory.llc';
+      const { session, stripeCustomerId } = await stripeClient.createSubscriptionCheckout({ customer: c.rows[0], baseUrl });
+      await pool.query(`UPDATE customers SET stripe_customer_id = COALESCE(stripe_customer_id, $1) WHERE id = $2`, [stripeCustomerId, req.params.id]);
+      await audit(req, 'stripe_checkout_create', { targetType: 'customer', targetId: req.params.id, details: { stripe_customer_id: stripeCustomerId, session_id: session.id, mode: stripeClient.getMode() } });
+      // Render a confirmation page with the URL — operator copies + emails it.
+      res.set('Content-Type', 'text/html; charset=utf-8');
+      res.send(adminPage('Checkout link', `
+        <a href="/admin/customers/${escapeHtml(req.params.id)}" class="muted">← back to customer</a>
+        <h1 style="margin-top:14px">Stripe Checkout link ready</h1>
+        <p class="muted">Send this URL to <strong>${escapeHtml(c.rows[0].contact_email)}</strong>. They'll enter their card and the subscription activates automatically; webhook flips <code>billing_status</code> to <code>active</code>.</p>
+        <div style="background:#0a0f1a;border:1px solid #1c2330;border-radius:4px;padding:12px 14px;margin:14px 0;font-family:monospace;font-size:13px;word-break:break-all">${escapeHtml(session.url)}</div>
+        <p><a href="${escapeHtml(session.url)}" target="_blank" rel="noopener">Open in new tab to verify</a> · <a href="/admin/customers/${escapeHtml(req.params.id)}">Back to customer</a></p>
+        <p class="muted" style="margin-top:18px;font-size:12px">Session expires in 24 hours. Re-create if the customer doesn't act in time.</p>
+      `, req.operator));
+    } catch (e) {
+      res.redirect(`/admin/customers/${req.params.id}?err=Stripe+error%3A+${encodeURIComponent(e.message.slice(0, 100))}`);
+    }
   });
 
   // POST handler for the manual billing-update form. No Stripe API

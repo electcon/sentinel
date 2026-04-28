@@ -50,6 +50,71 @@ app.use((req, res, next) => {
   next();
 });
 
+// Stripe webhook needs the RAW body for signature verification —
+// register before express.json() consumes it.
+app.post('/api/stripe-webhook', express.raw({ type: 'application/json', limit: '1mb' }), async (req, res) => {
+  try {
+    const stripeClient = require('./lib/stripe-client');
+    if (!stripeClient.isConfigured()) return res.status(503).json({ error: 'stripe not configured' });
+    let event;
+    try {
+      event = stripeClient.constructWebhookEvent(req.body, req.headers['stripe-signature']);
+    } catch (e) {
+      console.error('[stripe-webhook] signature verification failed:', e.message);
+      return res.status(400).json({ error: 'invalid signature' });
+    }
+
+    // Subscription state → billing_status. Resolve customer by Stripe
+    // customer ID stored in our customers row.
+    if (event.type === 'customer.subscription.created' ||
+        event.type === 'customer.subscription.updated' ||
+        event.type === 'customer.subscription.deleted') {
+      const sub = event.data.object;
+      const stripeCustomerId = typeof sub.customer === 'string' ? sub.customer : sub.customer?.id;
+      const status = stripeClient.mapSubscriptionStatus(sub.status);
+      const periodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
+      const startedAt = sub.start_date ? new Date(sub.start_date * 1000) : null;
+      const amountCents = sub.items?.data?.[0]?.price?.unit_amount || null;
+      const interval = sub.items?.data?.[0]?.price?.recurring?.interval || null;
+      const period = interval === 'year' ? 'annual' : (interval === 'month' ? 'monthly' : null);
+      try {
+        await pool.query(`
+          UPDATE customers
+          SET billing_status = $1,
+              billing_amount_cents = COALESCE($2, billing_amount_cents),
+              billing_period = COALESCE($3, billing_period),
+              billing_starts_at = COALESCE($4, billing_starts_at),
+              stripe_subscription_id = $5
+          WHERE stripe_customer_id = $6
+        `, [status, amountCents, period, startedAt, sub.id, stripeCustomerId]);
+        console.log(`[stripe-webhook] subscription ${event.type} → status=${status} for stripe_customer=${stripeCustomerId}`);
+      } catch (e) {
+        console.error('[stripe-webhook] DB update failed:', e.message);
+      }
+    } else if (event.type === 'invoice.paid' || event.type === 'invoice.payment_succeeded') {
+      const inv = event.data.object;
+      const stripeCustomerId = typeof inv.customer === 'string' ? inv.customer : inv.customer?.id;
+      try {
+        await pool.query(`UPDATE customers SET billing_status = 'active' WHERE stripe_customer_id = $1 AND billing_status IN ('trialing','past_due')`, [stripeCustomerId]);
+      } catch (_) {}
+      console.log(`[stripe-webhook] invoice paid for stripe_customer=${stripeCustomerId}`);
+    } else if (event.type === 'invoice.payment_failed') {
+      const inv = event.data.object;
+      const stripeCustomerId = typeof inv.customer === 'string' ? inv.customer : inv.customer?.id;
+      try {
+        await pool.query(`UPDATE customers SET billing_status = 'past_due' WHERE stripe_customer_id = $1`, [stripeCustomerId]);
+      } catch (_) {}
+      console.log(`[stripe-webhook] invoice payment_failed for stripe_customer=${stripeCustomerId}`);
+    } else {
+      // Other events ignored for now. Stripe expects 2xx for any event we successfully receive.
+    }
+    res.json({ received: true });
+  } catch (e) {
+    console.error('[stripe-webhook]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.use(express.json({ limit: '1mb' }));
 
 // ── Health (Render uses this for health checks) ─────────────────────
