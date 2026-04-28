@@ -664,6 +664,9 @@ app.use(require('./routes/dashboard')(pool));
 // ── Internal admin (Basic auth via ADMIN_PASSWORD) ─────────────────
 app.use(require('./routes/admin')(pool));
 
+// ── Customer-facing public API (Bearer token auth) ─────────────────
+app.use(require('./routes/api')(pool));
+
 // Public landing page at root. Authed visitors get bounced straight to
 // /dashboard via the session-cookie check; unauthed visitors get a
 // one-page marketing splash + beta-access form.

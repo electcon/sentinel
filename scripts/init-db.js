@@ -43,6 +43,29 @@ async function initSchema(pool) {
   // Force first-login password change. Set on provision; cleared on
   // first successful self-set in /dashboard/settings/password.
   await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE`);
+
+  // Customer API keys. Bearer-token auth for /api/v1/* routes. Hashed
+  // at rest (SHA-256 since these aren't user-chosen passwords; the
+  // entropy comes from us). The full key is shown ONCE on generation
+  // and never again — customer copies + stores it themselves.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS api_keys (
+      id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      customer_id     UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+      key_prefix      CHAR(12) NOT NULL,         -- first 12 chars (for identification + display)
+      key_hash        TEXT NOT NULL,              -- SHA-256 of the full key
+      label           TEXT,
+      scopes          TEXT[] NOT NULL DEFAULT ARRAY['read'],
+      active          BOOLEAN NOT NULL DEFAULT TRUE,
+      last_used_at    TIMESTAMPTZ,
+      use_count       INTEGER NOT NULL DEFAULT 0,
+      created_at      TIMESTAMPTZ DEFAULT NOW(),
+      revoked_at      TIMESTAMPTZ,
+      UNIQUE (key_prefix)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS api_keys_customer ON api_keys (customer_id, active) WHERE active = TRUE`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS api_keys_hash ON api_keys (key_hash) WHERE active = TRUE`);
   await pool.query(`CREATE INDEX IF NOT EXISTS customers_billing_status ON customers (billing_status) WHERE billing_status NOT IN ('free_beta', 'canceled')`);
 
   await pool.query(`

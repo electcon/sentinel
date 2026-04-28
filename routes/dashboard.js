@@ -22,6 +22,7 @@ const {
 } = require('../lib/auth');
 const { sendThreatAlert, generateWebhookSecret } = require('../lib/alert');
 const stripeClient = require('../lib/stripe-client');
+const { generateKey, hashKey } = require('../lib/api-key');
 
 // Capture a reviewer disposition into classifier_feedback. Best-effort —
 // log failures but don't block the action. Called from both the
@@ -1605,6 +1606,8 @@ ${reviewRows}
         <button type="submit">Save</button>
       </form>
 
+      ${await renderApiKeysPanel(pool, req.customer.id, req.query)}
+
       <h2>Change password</h2>
       <form method="POST" action="/dashboard/settings/password">
         <div class="field">
@@ -1637,6 +1640,27 @@ ${reviewRows}
   });
 
   // ── Alert routes management ────────────────────────────────────────
+  // ── API key management ────────────────────────────────────────────
+  r.post('/dashboard/settings/api-keys', authed, express.urlencoded({ extended: false }), async (req, res) => {
+    const label = (req.body.label || '').trim().slice(0, 100) || 'unnamed';
+    const { fullKey, keyPrefix, keyHash } = generateKey();
+    try {
+      const r2 = await pool.query(`
+        INSERT INTO api_keys (customer_id, key_prefix, key_hash, label, scopes, active)
+        VALUES ($1, $2, $3, $4, ARRAY['read'], TRUE)
+        RETURNING id
+      `, [req.customer.id, keyPrefix, keyHash, label]);
+      res.redirect(`/dashboard/settings?ok=${encodeURIComponent('API key created — copy it now: ' + fullKey)}&new_key_id=${r2.rows[0].id}`);
+    } catch (e) {
+      res.redirect('/dashboard/settings?err=' + encodeURIComponent('Could not create key: ' + e.message.slice(0, 100)));
+    }
+  });
+
+  r.post('/dashboard/settings/api-keys/:id/revoke', authed, express.urlencoded({ extended: false }), async (req, res) => {
+    await pool.query(`UPDATE api_keys SET active = FALSE, revoked_at = NOW() WHERE id = $1 AND customer_id = $2`, [req.params.id, req.customer.id]);
+    res.redirect('/dashboard/settings?ok=API+key+revoked');
+  });
+
   r.post('/dashboard/settings/alert-routes', authed, express.urlencoded({ extended: false }), async (req, res) => {
     const channel = req.body.channel;
     const destination = (req.body.destination || '').trim();
@@ -1774,6 +1798,41 @@ ${reviewRows}
   });
 
   return r;
+}
+
+async function renderApiKeysPanel(pool, customerId, query) {
+  const q = await pool.query(`
+    SELECT id, key_prefix, label, scopes, active, last_used_at, use_count, created_at, revoked_at
+    FROM api_keys WHERE customer_id = $1 ORDER BY active DESC, created_at DESC
+  `, [customerId]);
+  const fmt = (d) => {
+    if (!d) return '—';
+    const dt = d instanceof Date ? d : new Date(d);
+    return dt.toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+  };
+  const rows = q.rows.map(k => `
+    <tr>
+      <td><code style="font-size:12px">${escapeHtml(k.key_prefix)}…</code><div class="muted" style="font-size:11px">${escapeHtml(k.label || 'unnamed')}</div></td>
+      <td>${k.active ? '<span class="pill ok">active</span>' : '<span class="pill" style="background:#3d301a;color:#d8902f">revoked</span>'}</td>
+      <td class="muted">${k.last_used_at ? fmt(k.last_used_at) : 'never'}<div class="muted" style="font-size:11px">${k.use_count} requests</div></td>
+      <td class="muted">${fmt(k.created_at)}</td>
+      <td>${k.active ? `<form method="POST" action="/dashboard/settings/api-keys/${k.id}/revoke" onsubmit="return confirm('Revoke this API key? This cannot be undone.');"><button type="submit" class="danger" style="padding:4px 8px;font-size:11px">Revoke</button></form>` : ''}</td>
+    </tr>
+  `).join('');
+  return `<h2>API keys</h2>
+    <div class="muted" style="font-size:13px;margin-bottom:10px">
+      Read-only API access for integrations (SIEM, Slack bots, custom dashboards).
+      Endpoint: <code>https://sentinel.parallaxadvisory.llc/api/v1</code> · Auth header: <code>Authorization: Bearer sk_…</code>.
+      Rate limit: 60 requests/minute per key.
+    </div>
+    ${q.rowCount ? `<table>
+      <thead><tr><th>Key</th><th>Status</th><th>Last used</th><th>Created</th><th></th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>` : '<div class="empty">No API keys yet.</div>'}
+    <form method="POST" action="/dashboard/settings/api-keys" style="margin-top:14px;display:flex;gap:8px;align-items:center">
+      <input type="text" name="label" placeholder="Label (e.g. 'Slack bot', 'Splunk integration')" style="max-width:320px;display:inline-block;width:auto">
+      <button type="submit">+ Generate new key</button>
+    </form>`;
 }
 
 async function renderBillingPanel(pool, customer) {
