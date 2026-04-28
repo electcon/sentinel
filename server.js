@@ -203,6 +203,13 @@ app.post('/api/_smoke/reddit-run', requireSmokeToken, async (req, res) => {
   }
 });
 
+// Bluesky firehose stats (Jetstream WebSocket). Useful for confirming
+// the firehose is connected and processing posts.
+app.get('/api/_smoke/bluesky-firehose-stats', requireSmokeToken, (req, res) => {
+  if (!global._jetstream) return res.json({ enabled: false, hint: 'set BLUESKY_FIREHOSE_ENABLED=true on Render' });
+  res.json({ enabled: true, ...global._jetstream.getStats() });
+});
+
 // Trigger one Bluesky ingest run.
 app.post('/api/_smoke/bluesky-run', requireSmokeToken, async (req, res) => {
   try {
@@ -939,6 +946,22 @@ const PORT = parseInt(process.env.PORT, 10) || 10000;
     startScheduler();
   } else {
     console.log('[sched] disabled (set SCHEDULER_ENABLED=true to enable)');
+  }
+
+  // Bluesky Jetstream firehose — opt-in, off by default. When enabled,
+  // the polling worker still runs (useful as a backstop) but the
+  // firehose adds <60s latency on top.
+  if (process.env.BLUESKY_FIREHOSE_ENABLED === 'true') {
+    try {
+      const { JetstreamClient } = require('./lib/bluesky-jetstream');
+      global._jetstream = new JetstreamClient({ pool, log: (m) => console.log('[jetstream]', m) });
+      global._jetstream.start();
+      console.log('[jetstream] firehose started (opt-in)');
+    } catch (e) {
+      console.error('[jetstream] failed to start:', e.message);
+    }
+  } else {
+    console.log('[jetstream] disabled (set BLUESKY_FIREHOSE_ENABLED=true to enable)');
   }
 
   app.listen(PORT, () => {

@@ -168,6 +168,7 @@ Optional / per-source:
 - `STRIPE_PUBLISHABLE_KEY` — `pk_live_...` or `pk_test_...`. Currently unused server-side (Checkout is server-driven), but recommended for future client-side flows.
 - `STRIPE_WEBHOOK_SECRET` — `whsec_...`. Required for `/api/stripe-webhook` signature verification. Get this from Stripe dashboard when you create the webhook endpoint.
 - `STRIPE_BETA_PRICE_USD` (default 500), `STRIPE_BETA_PRICE_INTERVAL` ('month' default; 'year' valid) — controls the auto-created Sentinel Beta product/price.
+- `BLUESKY_FIREHOSE_ENABLED=true` — turn on the real-time Jetstream WebSocket subscription. Adds <60s latency (vs. 5-min poll). Polling worker keeps running as a backstop. Stats: `/api/_smoke/bluesky-firehose-stats`.
 
 ## Tests
 
