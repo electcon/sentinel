@@ -91,6 +91,54 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json', limit: '
       } catch (e) {
         console.error('[stripe-webhook] DB update failed:', e.message);
       }
+    } else if (event.type === 'checkout.session.completed') {
+      // Self-serve signup completion. The session carries
+      // metadata.sentinel_customer_id that we set in
+      // stripe-client.createSubscriptionCheckout. Activate the customer
+      // (pending_payment → beta), generate a password, send welcome email.
+      const session = event.data.object;
+      const sentinelId = session.metadata?.sentinel_customer_id;
+      const stripeCustomerId = typeof session.customer === 'string' ? session.customer : session.customer?.id;
+      if (sentinelId && session.payment_status === 'paid') {
+        try {
+          const cur = await pool.query(
+            `SELECT id, name, contact_email, status, password_hash FROM customers WHERE id = $1`,
+            [sentinelId]
+          );
+          const cust = cur.rows[0];
+          if (cust && cust.status === 'pending_payment' && !cust.password_hash) {
+            // Generate strong password — base32-ish, easy to dictate over phone.
+            const crypto = require('crypto');
+            const alphabet = 'abcdefghjkmnpqrstuvwxyz23456789';   // no l/o/0/1 ambiguity
+            const bytes = crypto.randomBytes(16);
+            let plaintext = '';
+            for (let i = 0; i < 16; i++) plaintext += alphabet[bytes[i] % alphabet.length];
+            const grouped = plaintext.match(/.{4}/g).join('-'); // xxxx-xxxx-xxxx-xxxx
+            const { hashPassword } = require('./lib/auth');
+            const passHash = await hashPassword(grouped);
+            await pool.query(
+              `UPDATE customers SET password_hash = $1, status = 'beta', stripe_customer_id = COALESCE(stripe_customer_id, $2), must_change_password = TRUE WHERE id = $3`,
+              [passHash, stripeCustomerId, sentinelId]
+            );
+            const { sendWelcome } = require('./lib/welcome');
+            const baseUrl = process.env.DASHBOARD_BASE_URL || 'https://sentinel.parallaxadvisory.llc';
+            const send = await sendWelcome({
+              to: cust.contact_email,
+              customerName: cust.name,
+              password: grouped,
+              loginUrl: baseUrl + '/login',
+              alertEmail: cust.contact_email,
+              digestEmail: cust.contact_email,
+              targets: []
+            });
+            console.log(`[stripe-webhook] self-serve activated id=${sentinelId} email_sent=${send.ok ? (send.dryRun ? 'dry-run' : 'yes') : 'FAILED:'+send.error}`);
+          } else {
+            console.log(`[stripe-webhook] checkout.session.completed for id=${sentinelId} — skipping (status=${cust?.status} password_set=${!!cust?.password_hash})`);
+          }
+        } catch (e) {
+          console.error('[stripe-webhook] self-serve activation failed:', e.message);
+        }
+      }
     } else if (event.type === 'invoice.paid' || event.type === 'invoice.payment_succeeded') {
       const inv = event.data.object;
       const stripeCustomerId = typeof inv.customer === 'string' ? inv.customer : inv.customer?.id;
@@ -764,6 +812,39 @@ app.get('/', async (req, res) => {
     <div class="tier tier-4"><div class="tier-label">Tier 4 — imminent</div><div class="desc">Time-bound threats with location and weapon mentioned. Same as Tier 3 plus optional Slack/PagerDuty.</div></div>
   </div>
 
+  ${process.env.STRIPE_SECRET_KEY ? `
+  <div style="background:#0e1422;border:1px solid #1c2330;border-radius:12px;padding:24px;margin:24px 0">
+    <h2 style="margin:0 0 14px;font-size:18px;text-transform:uppercase;letter-spacing:.05em;color:#8b949e">What's included — $500/month</h2>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px">
+      <div><div style="color:#7fff7f;font-weight:600;margin-bottom:4px">✓ All sources</div><div style="color:#cdd5e0;font-size:13px">Reddit, Bluesky (poll + real-time firehose), Google News, X (twitterapi.io), Telegram, TruthSocial. New sources roll out automatically.</div></div>
+      <div><div style="color:#7fff7f;font-weight:600;margin-bottom:4px">✓ Unlimited targets</div><div style="color:#cdd5e0;font-size:13px">Candidate, family, staff, opponents — add as many as you need. Each gets the full 4-tier classification.</div></div>
+      <div><div style="color:#7fff7f;font-weight:600;margin-bottom:4px">✓ Real-time tier-3+ alerts</div><div style="color:#cdd5e0;font-size:13px">Email and native Slack (paste your incoming-webhook URL). Custom HMAC-signed JSON webhooks for PagerDuty / Discord / your SIEM.</div></div>
+      <div><div style="color:#7fff7f;font-weight:600;margin-bottom:4px">✓ Daily + weekly digests</div><div style="color:#cdd5e0;font-size:13px">7am UTC daily summary; Sunday weekly executive report with week-over-week trend, top targets, review activity.</div></div>
+      <div><div style="color:#7fff7f;font-weight:600;margin-bottom:4px">✓ Public REST API + CSV export</div><div style="color:#cdd5e0;font-size:13px">Bearer-token auth, 60 req/min/key. SIEM-ready CSV export of mentions and threats. Documented at <code>/api/v1/docs</code>.</div></div>
+      <div><div style="color:#7fff7f;font-weight:600;margin-bottom:4px">✓ S3 evidence archive</div><div style="color:#cdd5e0;font-size:13px">Every classified mention's raw payload preserved on AWS S3 (Glacier after 90 days) for legal hand-off. 7-year retention.</div></div>
+      <div><div style="color:#7fff7f;font-weight:600;margin-bottom:4px">✓ Self-serve cancel</div><div style="color:#cdd5e0;font-size:13px">Cancel any time from the Stripe billing portal in your dashboard. No annual lock-in. Beta cohort pricing locked in.</div></div>
+      <div><div style="color:#7fff7f;font-weight:600;margin-bottom:4px">✓ Live tail + drill-downs</div><div style="color:#cdd5e0;font-size:13px">SSE-backed live mention stream. Per-author and per-target drill-downs with 30-day volume + repeat-offender flags.</div></div>
+    </div>
+  </div>
+
+  <div class="form-card" style="background:linear-gradient(180deg, #1a4a1a 0%, #0e1422 100%);border:1px solid #2a8c2a">
+    <h2>Start beta — $500/mo</h2>
+    <div class="sub">Self-serve checkout. Card billed monthly via Stripe; cancel any time from the customer dashboard. Login credentials emailed within 30 seconds of payment. Add your targets in Settings; first mentions land within 30 minutes.</div>
+    <form method="POST" action="/signup/start-checkout">
+      <div class="field"><label for="ssCampaign">Campaign / organization</label>
+        <input id="ssCampaign" name="campaign_name" type="text" required placeholder="e.g. Jolly for Governor"></div>
+      <div class="field"><label for="ssEmail">Contact email</label>
+        <input id="ssEmail" name="contact_email" type="email" required placeholder="you@campaign.com"></div>
+      <div class="field"><label for="ssName">Your name (optional)</label>
+        <input id="ssName" name="contact_name" type="text" placeholder="Campaign manager / chief of staff / etc."></div>
+      <div class="actions"><button type="submit">Continue to checkout →</button></div>
+      <div style="font-size:11px;color:#8b949e;margin-top:10px">By continuing you agree that Sentinel is a monitoring tool, not a security service, and that you retain responsibility for security posture and law-enforcement coordination.</div>
+    </form>
+  </div>
+
+  <div style="text-align:center;color:#5b6573;font-size:12px;margin:8px 0 24px">— or, want to talk first? —</div>
+  ` : ''}
+
   <div class="form-card">
     <h2>Request beta access</h2>
     <div class="sub">Friendly cohort. $0/mo during beta (June 15 – September 15). 30-min Zoom walkthrough to scope your target list.</div>
@@ -827,6 +908,108 @@ app.post('/beta-request', express.urlencoded({ extended: false, limit: '64kb' })
   }
 });
 
+// ── Self-serve checkout (public) ────────────────────────────────────
+// Public landing-page CTA → Stripe Checkout. Creates a Sentinel customer
+// row in 'pending_payment' status; password is generated + welcome email
+// sent ONLY after the Stripe webhook confirms checkout.session.completed.
+// Idempotent on contact_email — repeat clicks redirect existing customers
+// to /login instead of double-creating.
+app.post('/signup/start-checkout', express.urlencoded({ extended: false, limit: '64kb' }), async (req, res) => {
+  try {
+    const stripeClient = require('./lib/stripe-client');
+    if (!stripeClient.isConfigured()) return res.redirect('/?err=stripe-not-configured');
+
+    const campaignName = String(req.body?.campaign_name || '').trim().slice(0, 200);
+    const contactEmail = String(req.body?.contact_email || '').trim().toLowerCase().slice(0, 200);
+    const contactName  = String(req.body?.contact_name  || '').trim().slice(0, 200);
+    if (!campaignName || !contactEmail) return res.redirect('/?err=missing-fields');
+    if (!/.+@.+\..+/.test(contactEmail)) return res.redirect('/?err=invalid-email');
+
+    // Dedupe by contact_email. If an active/beta customer already exists,
+    // bounce them to /login. If a pending_payment row exists, reuse it.
+    const existing = await pool.query(
+      'SELECT id, status FROM customers WHERE LOWER(contact_email) = $1 ORDER BY created_at DESC LIMIT 1',
+      [contactEmail]
+    );
+    let customerId = null;
+    if (existing.rowCount) {
+      const e = existing.rows[0];
+      if (e.status === 'beta' || e.status === 'active') {
+        return res.redirect('/login?msg=' + encodeURIComponent('An account already exists for ' + contactEmail + '. Log in to manage billing.'));
+      }
+      customerId = e.id;
+      await pool.query(
+        `UPDATE customers SET name = $1, status = 'pending_payment' WHERE id = $2`,
+        [campaignName, customerId]
+      );
+    } else {
+      const ins = await pool.query(`
+        INSERT INTO customers (name, contact_email, alert_email, digest_email, status, password_hash, must_change_password)
+        VALUES ($1, $2, $2, $2, 'pending_payment', NULL, TRUE)
+        RETURNING id
+      `, [campaignName, contactEmail]);
+      customerId = ins.rows[0].id;
+    }
+
+    const baseUrl = process.env.DASHBOARD_BASE_URL || 'https://sentinel.parallaxadvisory.llc';
+    const sentinelCustomer = { id: customerId, name: campaignName, contact_email: contactEmail };
+    const { session, stripeCustomerId } = await stripeClient.createSubscriptionCheckout({
+      customer: sentinelCustomer,
+      baseUrl,
+      returnPath: '/signup/return'
+    });
+    // Tag the session for the webhook so we can distinguish self-serve from
+    // operator-driven checkout. Stripe Subscription metadata is set inside
+    // createSubscriptionCheckout; we need to also tag the session metadata.
+    // Persist stripe_customer_id while we have it.
+    await pool.query(
+      `UPDATE customers SET stripe_customer_id = $1 WHERE id = $2`,
+      [stripeCustomerId, customerId]
+    );
+    if (contactName) {
+      await pool.query(
+        `UPDATE customers SET billing_notes = COALESCE(billing_notes,'') || $1 WHERE id = $2`,
+        [`[self-serve signup] contact_name=${contactName.replace(/[\r\n]/g,' ').slice(0,200)}\n`, customerId]
+      );
+    }
+    res.redirect(303, session.url);
+  } catch (e) {
+    console.error('[signup/start-checkout]', e.message, e.stack?.slice(0, 500));
+    res.redirect('/?err=' + encodeURIComponent('Could not start checkout: ' + e.message.slice(0, 80)));
+  }
+});
+
+// Stripe redirects here on success. Activation happens via the webhook;
+// this page just confirms what's coming.
+app.get('/signup/return', async (req, res) => {
+  const status = req.query.status === 'success' ? 'success' : 'cancel';
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  res.send(`<!doctype html><html><head><meta charset="utf-8"><title>Sentinel — ${status === 'success' ? 'Welcome' : 'Checkout cancelled'}</title>
+<style>body{font-family:Inter,system-ui,sans-serif;background:#0a0f1a;color:#e6edf3;max-width:560px;margin:80px auto;padding:0 24px;line-height:1.6}
+h1{font-size:24px;margin:0 0 14px}.muted{color:#8b949e;font-size:14px}
+.card{background:#0e1422;border:1px solid #1c2330;border-radius:8px;padding:24px;margin-top:24px}
+a{color:#4f9af0}</style></head><body>
+${status === 'success' ? `
+<h1>✓ Payment received — welcome to Sentinel</h1>
+<p>Your subscription is active. We're emailing your login credentials to the address you used at checkout. Watch for it within 30 seconds.</p>
+<div class="card">
+  <strong>Next steps:</strong>
+  <ol style="margin:8px 0 0 18px;padding:0">
+    <li>Open the welcome email and click the login link</li>
+    <li>Change your password (forced on first login)</li>
+    <li>Add your monitored targets (candidate, family, staff) at <em>Settings → Targets</em></li>
+    <li>First mentions land within 15–30 minutes</li>
+  </ol>
+</div>
+<p class="muted" style="margin-top:24px">Didn't get the email? Check spam, or reply to <a href="mailto:david@parallaxadvisory.llc">david@parallaxadvisory.llc</a> with your campaign name and we'll resend manually.</p>
+` : `
+<h1>Checkout cancelled</h1>
+<p>No charge was made. Your spot is still open.</p>
+<p><a href="/">← Back to the landing page</a> to try again, or <a href="mailto:david@parallaxadvisory.llc">email us</a> if you'd like to talk first.</p>
+`}
+</body></html>`);
+});
+
 // ── In-process scheduler ────────────────────────────────────────────
 // At v1 scale we run the ingest + alert workers directly inside the
 // web process via setInterval. Single dyno, no separate Render Cron
@@ -846,6 +1029,7 @@ const SCHEDULES = [
   { name: 'cisa',      intervalMs: 60 * 60 * 1000,     startupDelayMs: 240 * 1000, run: () => require('./workers/cisa').runOnce({ pool, log: scheduledLog('cisa') }) },
   { name: 'digest',  intervalMs: 30 * 60 * 1000,     startupDelayMs: 120 * 1000, run: () => require('./workers/digest').runOnce({ pool, log: scheduledLog('digest') }) },
   { name: 'weekly',  intervalMs:  6 * 60 * 60 * 1000, startupDelayMs: 200 * 1000, run: () => require('./workers/weekly').runOnce({ pool, log: scheduledLog('weekly') }) },
+  { name: 'cost_anomaly', intervalMs: 60 * 60 * 1000, startupDelayMs: 300 * 1000, run: () => require('./workers/cost-anomaly').runOnce({ pool, log: scheduledLog('cost_anomaly') }) },
   { name: 'cleanup', intervalMs: 60 * 60 * 1000,     startupDelayMs: 180 * 1000, run: async () => {
       // Multi-table retention sweep, runs every hour.
       const out = {};

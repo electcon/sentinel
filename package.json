@@ -24,7 +24,9 @@
     "digest:run": "node workers/digest.js",
     "digest:force": "node workers/digest.js --force",
     "weekly:run": "node workers/weekly.js",
-    "weekly:force": "node workers/weekly.js --force"
+    "weekly:force": "node workers/weekly.js --force",
+    "cost-anomaly:run": "node workers/cost-anomaly.js",
+    "healthcheck": "node scripts/healthcheck.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.40.0",

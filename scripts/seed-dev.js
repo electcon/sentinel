@@ -33,23 +33,32 @@ const DEV_PASSWORD = process.env.SENTINEL_DEV_PASSWORD || 'sentinel-dev-2026';
 // mentions — good for verifying search hits land. None of these are
 // our actual beta customers; they're just convenient public figures
 // we can search against without ingesting random civilians' content.
+//
+// IMPORTANT: do NOT add bare-token aliases (single first/last names like
+// 'Crist', 'Jolly', 'Cinde', 'Warmington'). The name-match regex is
+// permissive by design (see lib/match.js) and bare tokens trip on
+// unrelated content all over: "Jolly Sailors", "Joe Warmington" (different
+// person same surname), Spanish/Portuguese words sharing a prefix, etc.
+// Aliases here should be either (a) explicit multi-token variants
+// ("Cinde Warmington for Governor", "@cinde-warmington") or (b) a known
+// nickname/handle that is itself unique enough to stand alone.
 const DEV_TARGETS = [
   {
     kind: 'candidate',
     name: 'Cinde Warmington',
-    aliases: ['Warmington', 'Cinde'],
+    aliases: [],
     search_terms: ['Cinde Warmington']
   },
   {
     kind: 'candidate',
     name: 'Eileen Laubacher',
-    aliases: ['Laubacher'],
-    search_terms: ['Laubacher']
+    aliases: [],
+    search_terms: ['Eileen Laubacher']
   },
   {
     kind: 'candidate',
     name: 'Charlie Crist',
-    aliases: ['Crist'],
+    aliases: [],
     search_terms: ['Charlie Crist']
   }
 ];

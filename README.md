@@ -30,6 +30,7 @@ Render web service (sentinel.parallaxadvisory.llc)
   │   ├─ reddit worker     (every 10 min — public .json search)
   │   ├─ rss worker        (every 15 min — Google News RSS per target)
   │   ├─ digest worker     (every 30 min — sends daily digest if 23h+ since last)
+  │   ├─ cost_anomaly      (every 60 min — flags 10× ratio or $5 jump in classifier spend)
   │   └─ cleanup worker    (every 60 min — prunes worker_runs > 7d)
   ├─ Customer dashboard  (/dashboard, /login, /logout, /dashboard/...)
   ├─ Internal admin      (/admin — Basic auth via ADMIN_PASSWORD)
@@ -78,15 +79,30 @@ re-run `provision-customer.js` with an updated JSON.
 ### Operating views
 
 - `/` — public marketing landing page + beta-access form (unauthed); auto-redirects to `/dashboard` if session cookie valid
-- `/dashboard` — customer view (logged-in)
-- `/admin` — David's view (Basic auth via `ADMIN_PASSWORD`):
-  - `/admin/customers` (+ `/admin/customers/:id` per-customer detail with hate-crime risk panel)
+- `/dashboard` — customer view (logged-in). Sub-routes:
+  - `/dashboard/live` — Server-Sent Events live tail of new mentions; `/dashboard/stream` is the underlying SSE endpoint
+  - `/dashboard/settings` — target CRUD, alert routing, API keys
+  - `/dashboard/billing/return`, `/dashboard/billing/portal` — Stripe Checkout return + Billing Portal redirect
+  - `/dashboard/authors/:handle` — per-author drill-down (mentions, tier history, repeat-offender flag)
+  - `/dashboard/compliance-report` — quarterly evidence packet (CSV + S3 manifest)
+  - `/dashboard/force-password-change` — first-login forced rotation
+- `/admin` — operator console (multi-operator scrypt auth + `ADMIN_PASSWORD` bootstrap fallback):
+  - `/admin/login`, `/admin/operators` — operator CRUD
+  - `/admin/customers` (+ `/admin/customers/:id` per-customer detail with hate-crime risk panel, repeat-offender list, and 30-day classifier spend rollup by model)
   - `/admin/provision` web form to onboard new customers
+  - `/admin/billing` — per-customer Stripe customer / checkout link / status
   - `/admin/leads` — beta-access form submissions with status workflow
   - `/admin/audit` — operator action history
+  - `/admin/cost-anomalies` — classifier-spend anomalies (10× ratio or $5 abs jump above 30-day median)
+  - `/admin/soc` — 24/7 SOC view across all customers
   - `/admin/classifier-quality` — reviewer-disposition rollups for drift detection
   - `/admin/telegram-channels` — operator-curated seed list
   - `/admin/workers`, `/admin/errors`, `/admin/threats`
+- `/api/v1/*` — public REST surface, Bearer-token auth (60/min/key) — see `API.md`
+- `/signup/start-checkout` — public self-serve Stripe Checkout (POST campaign_name + contact_email, redirects to Stripe; webhook activates on payment + emails creds)
+- `/signup/return` — Stripe success/cancel landing page
+- `/api/stripe-webhook` — Stripe event sink (signature-verified, raw body); handles subscription.* + invoice.* + checkout.session.completed
+- `/threat-ack/:token` — signed one-click ack from alert email (GET confirms, POST acts)
 - `/status` — public health page (no PII)
 - `/api/health` — JSON health check (used by uptime monitors)
 
@@ -158,7 +174,7 @@ Optional / per-source:
   Defaults to `https://sentinel.parallaxadvisory.llc` when unset.
 - `TWITTERAPI_API_KEY` — X ingest via twitterapi.io
 - `FBI_CDE_API_KEY` — FBI Crime Data Explorer (free key from api.data.gov)
-- `CISA_TAXII_*` — see `CISA_AIS_ONBOARDING.md`; worker dormant until set
+- `CISA_TAXII_*` — see `CISA_AIS_ONBOARDING.pdf`; worker dormant until set
 - `OPENROUTER_API_KEY` + `CLASSIFIER_PROVIDER=openrouter` + `OPENROUTER_MODEL` —
   use OpenRouter instead of direct Anthropic
 - `SESSION_SECRET` — cookie signing (falls back to SMOKE_TOKEN if unset)
@@ -174,6 +190,19 @@ Optional / per-source:
 - `STRIPE_BETA_PRICE_USD` (default 500), `STRIPE_BETA_PRICE_INTERVAL` ('month' default; 'year' valid) — controls the auto-created Sentinel Beta product/price.
 - `BLUESKY_FIREHOSE_ENABLED=true` — turn on the real-time Jetstream WebSocket subscription. Adds <60s latency (vs. 5-min poll). Polling worker keeps running as a backstop. Stats: `/api/_smoke/bluesky-firehose-stats`.
 
+## Healthcheck
+
+```bash
+SENTINEL_BASE_URL=https://sentinel.parallaxadvisory.llc \
+SMOKE_TOKEN=$SMOKE_TOKEN \
+npm run healthcheck
+```
+
+Hits `/api/health`, `/status.json`, `/api/v1`, plus the low-risk smoke
+endpoints when `SMOKE_TOKEN` is set. Per-worker staleness budgets account
+for actual cadence (alert: 5 min, weekly: 8 days, etc.). Exit code 0 if
+all green, 1 on any failure — suitable for cron / external uptime monitors.
+
 ## Tests
 
 ```bash
@@ -181,13 +210,33 @@ npm test
 ```
 
 Covers `lib/match` (alias regex matching edge cases), `lib/auth` (scrypt +
-session signing), and `classify` (JSON-extraction parser robust against
-LLM markdown wrapping). 29 tests; run in <1s.
+session signing), `lib/api-key` (sk_ generator + SHA-256 hash invariants),
+`lib/operator-auth` (HMAC session verify, tamper + expiry rejection),
+`lib/stripe-client` (mode detection, subscription-status mapping),
+`lib/alert` Slack envelope (color/title/fields/ts + URL validation),
+`lib/digest` daily-digest rendering (subject pluralization, XSS guard,
+tier ordering, body clamps), `lib/weekly-report` (week-over-week trend
+classification, XSS guard, review-activity rendering), `lib/welcome`
+(target list rendering, XSS guard on URL/password/target, kind default),
+`lib/api-key` Bearer middleware (401 on missing/malformed/revoked,
+attaches req.customer + req.apiKey, 500 sanitization, suspended-customer
+exclusion), `routes/api.applyBucket` (token-bucket math: refill rate, cap,
+retry-after, independence),
+`lib/classifier-cost` (per-model price lookup with cache_read 0.10× +
+cache_creation 1.25× input rate, env override, micro-USD formatter),
+`routes/api.csvField` + `csvRow` (RFC 4180 escape for comma / quote /
+CRLF / Date), and
+`classify` (JSON-extraction parser robust against LLM markdown wrapping).
+147 tests; run in <5s.
 
 ## Reference docs
 
 - `THREAT_TAXONOMY.md` — the 4-tier rubric the classifier reads as system prompt
 - `ARCHITECTURE.md` — system shape, full Postgres schema, S3 layout, cost model
+- `API.md` — public `/api/v1` surface for customer integrations
+- `STRIPE_ONBOARDING.md` — billing setup (product/price, webhook endpoint, modes)
+- `TRUTHSOCIAL_ONBOARDING.md` — TruthSocial access-token provisioning
+- `CISA_AIS_ONBOARDING.pdf` — TAXII 2.1 cyber-indicator feed setup
 - `BETA_PITCH.md` — what David sends to campaign managers + 1-page beta agreement
 - `WEEK_1_LOG.md` — running execution log
 - `HIRING.md` — **shelved** (David is building solo with Claude — no contractor)
@@ -195,19 +244,27 @@ LLM markdown wrapping). 29 tests; run in <1s.
 ## v1 scope (locked)
 
 In:
-- Reddit + Bluesky + RSS + X ingest
-- Per-customer target registry with bulk-import + CRUD
-- Claude-driven 4-tier threat classifier (Anthropic direct or OpenRouter)
+- Reddit + Bluesky (poll + Jetstream firehose) + RSS + X + Telegram + TruthSocial ingest
+- Per-customer target registry with bulk-import + CRUD; per-target risk panel
+- Claude-driven 4-tier threat classifier (Anthropic direct or OpenRouter) with
+  author-watch repeat-offender auto-bump (3+ T2+ in 30d → tier bump)
 - Web dashboard with threat queue, mentions list/search, mention volume chart,
-  CSV export, settings UI, audit-trail notes on threat actions
-- Daily digest email + real-time tier-3+ alerts
-- Internal `/admin` page for ops visibility
+  CSV export, settings UI, audit-trail notes, per-author drill-down,
+  compliance-report export, API-key management
+- Daily digest email + real-time tier-3+ alerts + weekly executive report
+- Alert routes: email · native Slack (paste incoming-webhook URL — no
+  receiver to deploy) · HMAC-signed JSON webhook (PagerDuty / Discord / custom)
+- Signed-token one-click ack from email (`/threat-ack/:token`)
+- Public `/api/v1` REST surface (Bearer-token auth, 60/min rate limit)
+- Stripe Checkout + Billing Portal (subscription self-serve)
+- Multi-operator `/admin` console with audit log, classifier-quality rollups,
+  beta-leads workflow, per-customer billing controls, telegram-channels seed
 - Public `/status` page
+- AWS S3 evidence archive (30d → IA, 90d → Glacier)
 
 Out (Phase 2 candidates):
-- TruthSocial / Mastodon ingest
-- Real-time Bluesky firehose (Jetstream)
+- Mastodon ingest
 - SSO (Google Workspace / Microsoft 365)
-- Self-serve signup
+<!-- Self-serve signup landed: see `/signup/start-checkout` → Stripe Checkout → webhook activates the customer + emails creds. Invite-only `/beta-request` flow remains as the "talk first" path for friendly cohort. -->
 - Mobile alerts (SMS, push)
-- Custom domain + TLS
+- Custom domain per customer

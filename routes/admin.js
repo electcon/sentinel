@@ -11,6 +11,7 @@ const { hashPassword } = require('../lib/auth');
 const { sendWelcome } = require('../lib/welcome');
 const opAuth = require('../lib/operator-auth');
 const stripeClient = require('../lib/stripe-client');
+const { formatMicroUsd } = require('../lib/classifier-cost');
 
 function escapeHtml(s) {
   return String(s == null ? '' : s)
@@ -78,6 +79,7 @@ function adminPage(title, body, operator) {
   <a href="/admin/telegram-channels">telegram</a>
   <a href="/admin/soc" style="background:#5e0e16;color:#fff;padding:3px 10px;border-radius:3px">SOC</a>
   <a href="/admin/billing">billing</a>
+  <a href="/admin/cost-anomalies">cost</a>
   <a href="/admin/leads">leads</a>
   <a href="/admin/audit">audit</a>
   <a href="/admin/operators">operators</a>
@@ -119,18 +121,57 @@ label{display:block;color:#8b949e;font-size:13px;margin-bottom:5px}
 input{width:100%;background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px 12px;border-radius:4px;font-size:14px;margin-bottom:14px}
 button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-radius:4px;font-size:14px;font-weight:600;cursor:pointer}
 .muted{color:#8b949e;font-size:12px;text-align:center;margin-top:18px}
-</style></head><body><div class="card"><h1>SENTINEL · OPERATOR LOGIN</h1>${err}<form method="POST" action="/admin/login">
-<input type="hidden" name="next" value="${escapeHtml(next)}">
-<label for="email">Email</label><input id="email" name="email" type="email" required autofocus>
-<label for="password">Password</label><input id="password" name="password" type="password" required>
-<button type="submit">Log in</button></form>
-<div class="muted">Operator accounts only. Bootstrap with ADMIN_PASSWORD via Basic auth on first install, then create real operator accounts via <code>scripts/add-operator.js</code>.</div>
+.tabs{display:flex;gap:6px;margin-bottom:18px}
+.tabs a{flex:1;text-align:center;padding:8px;background:#0a0f1a;color:#8b949e;text-decoration:none;border-radius:4px;font-size:13px;border:1px solid #1c2330}
+.tabs a.active{background:#1a3a5c;color:#cfe5ff;border-color:#2a5a8c}
+</style></head><body><div class="card"><h1>SENTINEL · OPERATOR LOGIN</h1>
+<div class="tabs">
+  <a href="/admin/login${next !== '/admin' ? '?next=' + encodeURIComponent(next) : ''}" class="${req.query.mode === 'bootstrap' ? '' : 'active'}">Operator</a>
+  <a href="/admin/login?mode=bootstrap${next !== '/admin' ? '&next=' + encodeURIComponent(next) : ''}" class="${req.query.mode === 'bootstrap' ? 'active' : ''}">Bootstrap</a>
+</div>
+${err}
+${req.query.mode === 'bootstrap' ? `
+<form method="POST" action="/admin/login">
+  <input type="hidden" name="next" value="${escapeHtml(next)}">
+  <input type="hidden" name="mode" value="bootstrap">
+  <label for="bootstrap_password">ADMIN_PASSWORD</label>
+  <input id="bootstrap_password" name="password" type="password" required autofocus placeholder="from Render env">
+  <button type="submit">Log in (bootstrap)</button>
+</form>
+<div class="muted">Bootstrap mode — uses the <code>ADMIN_PASSWORD</code> env var directly. Use this until you create your first operator with <code>scripts/add-operator.js</code>.</div>
+` : `
+<form method="POST" action="/admin/login">
+  <input type="hidden" name="next" value="${escapeHtml(next)}">
+  <label for="email">Email</label><input id="email" name="email" type="email" required autofocus>
+  <label for="password">Password</label><input id="password" name="password" type="password" required>
+  <button type="submit">Log in</button>
+</form>
+<div class="muted">Need to bootstrap? Use the Bootstrap tab and <code>ADMIN_PASSWORD</code>. Create operator accounts via <code>scripts/add-operator.js</code>.</div>
+`}
 </div></body></html>`);
   });
 
   r.post('/admin/login', express.urlencoded({ extended: false }), async (req, res) => {
+    const crypto = require('crypto');
     const next = req.body.next || '/admin';
-    const op = await opAuth.authenticate(pool, req.body.email, req.body.password || '');
+    const password = req.body.password || '';
+
+    // Bootstrap path: password-only login using ADMIN_PASSWORD. Sets the
+    // same session cookie as a real operator (operatorId = null sentinel
+    // string handled by requireOperator). Constant-time compare.
+    if (req.body.mode === 'bootstrap') {
+      const expected = process.env.ADMIN_PASSWORD || '';
+      if (expected && password) {
+        const a = Buffer.from(password); const b = Buffer.from(expected);
+        if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
+          opAuth.setSessionCookie(res, 'bootstrap');
+          return res.redirect(next.startsWith('/admin') ? next : '/admin');
+        }
+      }
+      return res.redirect(`/admin/login?mode=bootstrap&err=1&next=${encodeURIComponent(next)}`);
+    }
+
+    const op = await opAuth.authenticate(pool, req.body.email, password);
     if (!op) return res.redirect(`/admin/login?err=1&next=${encodeURIComponent(next)}`);
     opAuth.setSessionCookie(res, op.id);
     res.redirect(next.startsWith('/admin') ? next : '/admin');
@@ -257,11 +298,19 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
   r.get('/admin/customers', gate, async (req, res) => {
     const flash = req.query.ok ? `<div style="background:#1a4a1a;color:#7fff7f;padding:10px;margin-bottom:14px;border-radius:4px">${escapeHtml(req.query.ok)}</div>` : '';
     const r2 = await pool.query(`
-      SELECT c.*, COALESCE(t.n, 0)::int AS target_count,
-             COALESCE(m.n, 0)::int AS mention_count
+      SELECT c.*,
+             COALESCE(t.n, 0)::int AS target_count,
+             COALESCE(m.n, 0)::int AS mention_count,
+             COALESCE(cost.cost_30d, 0)::bigint AS cost_30d_micro
       FROM customers c
       LEFT JOIN (SELECT customer_id, COUNT(*) AS n FROM targets GROUP BY customer_id) t ON t.customer_id = c.id
       LEFT JOIN (SELECT customer_id, COUNT(*) AS n FROM mentions GROUP BY customer_id) m ON m.customer_id = c.id
+      LEFT JOIN (
+        SELECT customer_id, SUM(cost_usd_micro) AS cost_30d
+        FROM classifications
+        WHERE created_at > NOW() - INTERVAL '30 days' AND cost_usd_micro IS NOT NULL
+        GROUP BY customer_id
+      ) cost ON cost.customer_id = c.id
       ORDER BY c.created_at DESC
     `);
     const billingPill = (s) => {
@@ -282,6 +331,7 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
         <td>${billingCell}</td>
         <td>${c.target_count}</td>
         <td>${c.mention_count}</td>
+        <td>${(+c.cost_30d_micro || 0) > 0 ? `<strong>${formatMicroUsd(+c.cost_30d_micro)}</strong>` : '<span class="muted">—</span>'}</td>
         <td class="muted">${escapeHtml(c.contact_email)}</td>
         <td>${loginCell}</td>
         <td class="muted">${fmtTime(c.created_at)}</td>
@@ -295,7 +345,7 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
       ${flash}
       <div style="margin:14px 0"><a href="/admin/provision"><button style="background:#4f9af0;color:#fff;border:0;padding:8px 14px;border-radius:4px;cursor:pointer;font-size:13px">+ Provision new customer</button></a></div>
       <table>
-        <thead><tr><th>Name / ID</th><th>Status</th><th>Billing</th><th>Targets</th><th>Mentions</th><th>Contact</th><th>Last login</th><th>Created</th><th>PW</th><th></th></tr></thead>
+        <thead><tr><th>Name / ID</th><th>Status</th><th>Billing</th><th>Targets</th><th>Mentions</th><th>Cost (30d)</th><th>Contact</th><th>Last login</th><th>Created</th><th>PW</th><th></th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     `;
@@ -309,7 +359,7 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
     if (!c.rowCount) return res.status(404).send('not found');
     const cust = c.rows[0];
 
-    const [targets, recent, repeatOffenders] = await Promise.all([
+    const [targets, recent, repeatOffenders, costRollup, costByModel] = await Promise.all([
       pool.query('SELECT id, kind, name, aliases, search_terms FROM targets WHERE customer_id = $1 ORDER BY name', [req.params.id]),
       pool.query(`
         SELECT m.id, m.threat_tier, m.tier_bumped, m.source, m.source_url, m.posted_at, m.body_excerpt, t.name AS target_name
@@ -328,6 +378,30 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
         HAVING COUNT(*) FILTER (WHERE threat_tier >= 2) >= 2
         ORDER BY bad_count DESC, last_seen DESC
         LIMIT 10
+      `, [req.params.id]),
+      pool.query(`
+        SELECT
+          COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours')::int AS calls_24h,
+          COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days')::int  AS calls_7d,
+          COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '30 days')::int AS calls_30d,
+          COALESCE(SUM(cost_usd_micro) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours'), 0)::bigint AS cost_24h,
+          COALESCE(SUM(cost_usd_micro) FILTER (WHERE created_at > NOW() - INTERVAL '7 days'),  0)::bigint AS cost_7d,
+          COALESCE(SUM(cost_usd_micro) FILTER (WHERE created_at > NOW() - INTERVAL '30 days'), 0)::bigint AS cost_30d,
+          COALESCE(SUM(input_tokens)  FILTER (WHERE created_at > NOW() - INTERVAL '30 days'), 0)::bigint AS in_tokens_30d,
+          COALESCE(SUM(output_tokens) FILTER (WHERE created_at > NOW() - INTERVAL '30 days'), 0)::bigint AS out_tokens_30d
+        FROM classifications
+        WHERE customer_id = $1
+      `, [req.params.id]),
+      pool.query(`
+        SELECT model,
+               COUNT(*)::int AS calls,
+               COALESCE(SUM(cost_usd_micro), 0)::bigint AS cost
+        FROM classifications
+        WHERE customer_id = $1
+          AND created_at > NOW() - INTERVAL '30 days'
+          AND cost_usd_micro IS NOT NULL
+        GROUP BY model
+        ORDER BY cost DESC
       `, [req.params.id])
     ]);
 
@@ -450,6 +524,31 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
           </form>
         </details>
       </div>
+      ${(() => {
+        const c = costRollup.rows[0] || {};
+        const calls30 = +c.calls_30d || 0;
+        if (calls30 === 0) return '';
+        const cost24 = formatMicroUsd(+c.cost_24h || 0);
+        const cost7  = formatMicroUsd(+c.cost_7d  || 0);
+        const cost30 = formatMicroUsd(+c.cost_30d || 0);
+        const inK    = Math.round((+c.in_tokens_30d  || 0) / 1000);
+        const outK   = Math.round((+c.out_tokens_30d || 0) / 1000);
+        const perCall = calls30 > 0 ? formatMicroUsd(Math.round((+c.cost_30d || 0) / calls30)) : '$0';
+        const modelRows = costByModel.rows.map(m =>
+          `<tr><td><code style="font-size:12px">${escapeHtml(m.model || 'unknown')}</code></td><td>${m.calls}</td><td><strong>${formatMicroUsd(+m.cost || 0)}</strong></td></tr>`
+        ).join('');
+        return `<div class="card" style="margin-top:14px;background:#101a26;border:1px solid #1c2330">
+          <div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Classifier spend</div>
+          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px">
+            <div><div style="font-size:24px;font-weight:600">${cost24}</div><div class="muted" style="font-size:12px">last 24h · ${+c.calls_24h || 0} calls</div></div>
+            <div><div style="font-size:24px;font-weight:600">${cost7}</div><div class="muted" style="font-size:12px">last 7 days · ${+c.calls_7d || 0} calls</div></div>
+            <div><div style="font-size:24px;font-weight:600">${cost30}</div><div class="muted" style="font-size:12px">last 30 days · ${calls30} calls</div></div>
+          </div>
+          <div class="muted" style="font-size:12px;margin-bottom:10px">30-day rollup: ${inK.toLocaleString()}K input tokens · ${outK.toLocaleString()}K output tokens · avg ${perCall}/call</div>
+          ${modelRows ? `<table style="font-size:13px"><thead><tr><th>Model</th><th>Calls (30d)</th><th>Cost</th></tr></thead><tbody>${modelRows}</tbody></table>` : ''}
+        </div>`;
+      })()}
+
       <h2>Targets (${targets.rowCount})</h2>
       ${targets.rowCount ? `<table><thead><tr><th>Kind</th><th>Name</th><th>Aliases</th><th>Search terms</th></tr></thead><tbody>${targetRows}</tbody></table>` : '<div class="muted">No targets.</div>'}
 
@@ -1408,14 +1507,26 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
       ORDER BY billing_status, billing_period
     `);
 
-    // Customer-by-customer detail
+    // Customer-by-customer detail. LEFT JOIN classifier-cost rollup so
+    // we can show per-customer 30-day Anthropic + OpenRouter spend
+    // alongside MRR (margin signal: who's costing more than they pay?).
     const detail = await pool.query(`
-      SELECT id, name, contact_email, billing_status, billing_amount_cents,
-             billing_period, billing_starts_at, stripe_customer_id,
-             stripe_subscription_id, last_login_at, billing_notes
-      FROM customers
+      SELECT c.id, c.name, c.contact_email, c.billing_status, c.billing_amount_cents,
+             c.billing_period, c.billing_starts_at, c.stripe_customer_id,
+             c.stripe_subscription_id, c.last_login_at, c.billing_notes,
+             COALESCE(cost.cost_30d, 0)::bigint AS cost_30d_micro,
+             COALESCE(cost.calls_30d, 0)::int  AS calls_30d
+      FROM customers c
+      LEFT JOIN (
+        SELECT customer_id,
+               SUM(cost_usd_micro) AS cost_30d,
+               COUNT(*)             AS calls_30d
+        FROM classifications
+        WHERE created_at > NOW() - INTERVAL '30 days'
+        GROUP BY customer_id
+      ) cost ON cost.customer_id = c.id
       ORDER BY
-        CASE billing_status
+        CASE c.billing_status
           WHEN 'past_due' THEN 1
           WHEN 'active'   THEN 2
           WHEN 'trialing' THEN 3
@@ -1423,7 +1534,17 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
           WHEN 'canceled' THEN 5
           ELSE 6
         END,
-        created_at DESC
+        c.created_at DESC
+    `);
+
+    // Cross-customer classifier spend rollup
+    const costTotals = await pool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours')::int AS calls_24h,
+        COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '30 days')::int AS calls_30d,
+        COALESCE(SUM(cost_usd_micro) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours'), 0)::bigint AS cost_24h,
+        COALESCE(SUM(cost_usd_micro) FILTER (WHERE created_at > NOW() - INTERVAL '30 days'),  0)::bigint AS cost_30d
+      FROM classifications
     `);
 
     // Aggregate MRR across active+trialing
@@ -1447,6 +1568,15 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
       return `<span class="pill" style="background:${c[0]};color:${c[1]}">${escapeHtml(s || '—')}</span>`;
     };
 
+    // Open cost-anomaly count for the banner.
+    const anomalyCount = await pool.query(`SELECT COUNT(*)::int AS n FROM cost_anomalies WHERE status = 'open'`).catch(() => ({ rows: [{ n: 0 }] }));
+    const anomalyN = anomalyCount.rows[0]?.n || 0;
+    const anomalyBanner = anomalyN
+      ? `<div style="background:#3d301a;border-left:3px solid #d8902f;padding:12px 14px;margin:14px 0;font-size:14px">
+           <strong style="color:#d8902f">⚠ ${anomalyN} open classifier-spend anomal${anomalyN === 1 ? 'y' : 'ies'}</strong> —
+           <a href="/admin/cost-anomalies" style="color:#ffe0a3">review and acknowledge</a>.
+         </div>` : '';
+
     const pastDueRows = detail.rows.filter(c => c.billing_status === 'past_due');
     const pastDueBanner = pastDueRows.length
       ? `<div style="background:#5e0e16;border-left:3px solid #ff7080;padding:12px 14px;margin:14px 0">
@@ -1455,21 +1585,39 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
            — payment failed; reach out via secure channel and offer the customer the Manage-billing portal link.
          </div>` : '';
 
-    const rows = detail.rows.map(c => `
+    // Compute monthly cost-per-customer + margin pill if we have an MRR.
+    const rows = detail.rows.map(c => {
+      const monthlyCostMicro = +c.cost_30d_micro || 0;
+      const costStr = monthlyCostMicro ? formatMicroUsd(monthlyCostMicro) : '<span class="muted">—</span>';
+      let marginCell = '<span class="muted">—</span>';
+      if (c.billing_amount_cents && c.billing_period && monthlyCostMicro > 0) {
+        const monthlyRevCents = c.billing_period === 'annual'
+          ? Math.round(c.billing_amount_cents / 12)
+          : c.billing_amount_cents;
+        const monthlyRevMicro = monthlyRevCents * 10_000;     // cents → micro-USD
+        const marginMicro = monthlyRevMicro - monthlyCostMicro;
+        const marginPctNum = monthlyRevMicro > 0 ? (marginMicro / monthlyRevMicro) * 100 : 0;
+        const color = marginPctNum >= 90 ? '#7fff7f' : marginPctNum >= 70 ? '#cfe5ff' : marginPctNum >= 40 ? '#d8902f' : '#ff7f7f';
+        marginCell = `<span style="color:${color};font-weight:600">${marginPctNum.toFixed(0)}%</span>`;
+      }
+      return `
       <tr>
         <td><strong>${escapeHtml(c.name)}</strong><div class="muted" style="font-size:11px">${escapeHtml(c.contact_email)}</div></td>
         <td>${statusPill(c.billing_status || 'free_beta')}</td>
         <td>${c.billing_amount_cents ? `$${(c.billing_amount_cents/100).toFixed(0)}/${c.billing_period === 'annual' ? 'yr' : 'mo'}` : '<span class="muted">—</span>'}</td>
+        <td>${costStr}<div class="muted" style="font-size:10px">${c.calls_30d || 0} calls</div></td>
+        <td>${marginCell}</td>
         <td class="muted">${fmtTime(c.billing_starts_at)}</td>
         <td>${c.stripe_subscription_id ? `<code style="font-size:10px">${escapeHtml(c.stripe_subscription_id.slice(0, 16))}…</code>` : '<span class="muted">—</span>'}</td>
         <td class="muted">${c.last_login_at ? ago(c.last_login_at) : 'never'}</td>
         <td><a href="/admin/customers/${c.id}">open</a></td>
       </tr>
-    `).join('');
+    `;}).join('');
 
     const body = `
       <h1>Billing overview</h1>
       <div class="muted">${detail.rowCount} customer${detail.rowCount === 1 ? '' : 's'} total. Numbers below are based on operator-set billing_status; Stripe is the source of truth when wired (status auto-updates via webhook).</div>
+      ${anomalyBanner}
       ${pastDueBanner}
 
       <div class="row" style="display:flex;gap:14px;margin:18px 0;flex-wrap:wrap">
@@ -1482,14 +1630,125 @@ button{width:100%;background:#4f9af0;color:#fff;border:0;padding:11px;border-rad
         <div class="card" style="flex:1 1 100px"><div class="muted">Canceled</div><div style="font-size:22px;font-weight:600;color:#8b949e">${canceledCount}</div></div>
       </div>
 
+      ${(() => {
+        const ct = costTotals.rows[0] || {};
+        const cost24 = +ct.cost_24h || 0;
+        const cost30 = +ct.cost_30d || 0;
+        if (!cost30) return '';
+        const projectedMonthly = cost24 * 30;
+        return `<h2>Classifier spend</h2>
+        <div class="muted" style="font-size:12px;margin-bottom:8px">Aggregate Anthropic + OpenRouter spend across all customers. Per-customer breakdown is in the customer table below; per-customer drill-down on the customer detail page.</div>
+        <div class="row" style="display:flex;gap:14px;margin:8px 0 18px;flex-wrap:wrap">
+          <div class="card" style="flex:1 1 160px"><div class="muted">Last 24h</div><div style="font-size:22px;font-weight:700">${formatMicroUsd(cost24)}</div><div class="muted" style="font-size:11px">${ct.calls_24h || 0} calls</div></div>
+          <div class="card" style="flex:1 1 160px"><div class="muted">Projected monthly (24h × 30)</div><div style="font-size:22px;font-weight:700">${formatMicroUsd(projectedMonthly)}</div></div>
+          <div class="card" style="flex:1 1 160px"><div class="muted">Actual last 30 days</div><div style="font-size:22px;font-weight:700">${formatMicroUsd(cost30)}</div><div class="muted" style="font-size:11px">${ct.calls_30d || 0} calls</div></div>
+        </div>`;
+      })()}
+
       <h2>Customers</h2>
       ${detail.rowCount ? `<table>
-        <thead><tr><th>Customer</th><th>Status</th><th>Plan</th><th>Started</th><th>Stripe sub</th><th>Last login</th><th></th></tr></thead>
+        <thead><tr><th>Customer</th><th>Status</th><th>Plan</th><th>Cost (30d)</th><th>Margin</th><th>Started</th><th>Stripe sub</th><th>Last login</th><th></th></tr></thead>
         <tbody>${rows}</tbody>
-      </table>` : '<div class="muted">No customers yet.</div>'}
+      </table>
+      <div class="muted" style="font-size:11px;margin-top:6px">Margin = (monthly revenue − classifier cost) ÷ monthly revenue. Color: green ≥90% · blue ≥70% · amber ≥40% · red &lt;40%.</div>` : '<div class="muted">No customers yet.</div>'}
     `;
     res.set('Content-Type', 'text/html; charset=utf-8');
     res.send(adminPage('billing', body, req.operator));
+  });
+
+  // ── /admin/cost-anomalies ─────────────────────────────────────────
+  // Worker writes one row per detection (workers/cost-anomaly.js).
+  // Operators ack to silence; dismiss for "this was expected" (e.g. test
+  // traffic, planned target onboarding).
+  r.get('/admin/cost-anomalies', gate, async (req, res) => {
+    const flash = req.query.ok
+      ? `<div style="background:#1a4a1a;color:#7fff7f;padding:10px;margin-bottom:14px;border-radius:4px">${escapeHtml(req.query.ok)}</div>` : '';
+
+    const q = await pool.query(`
+      SELECT a.id, a.detected_at, a.cost_24h_micro, a.median_30d_micro,
+             a.ratio, a.jump_micro, a.reason, a.status, a.notified_at,
+             a.acknowledged_by, a.acknowledged_at,
+             c.id AS customer_id, c.name AS customer_name, c.contact_email
+      FROM cost_anomalies a
+      JOIN customers c ON c.id = a.customer_id
+      WHERE a.detected_at > NOW() - INTERVAL '60 days'
+      ORDER BY
+        CASE a.status WHEN 'open' THEN 1 WHEN 'acknowledged' THEN 2 ELSE 3 END,
+        a.detected_at DESC
+    `);
+
+    const fmtRatio = (r) => r == null ? '∞×' : (Number(r) >= 100 ? '99×+' : Number(r).toFixed(1) + '×');
+    const statusPill = (s) => {
+      const c = s === 'open' ? ['#3d301a', '#d8902f'] : s === 'acknowledged' ? ['#1a3a5c', '#cfe5ff'] : ['#1c2330', '#8b949e'];
+      return `<span class="pill" style="background:${c[0]};color:${c[1]}">${escapeHtml(s)}</span>`;
+    };
+    const reasonPill = (r) => {
+      const c = r === 'ratio' ? ['#5e0e16', '#ff7f7f'] : ['#3d301a', '#d8902f'];
+      return `<span class="pill" style="background:${c[0]};color:${c[1]};font-size:10px">${escapeHtml(r)}</span>`;
+    };
+
+    const rows = q.rows.map(a => `
+      <tr>
+        <td><strong>${escapeHtml(a.customer_name)}</strong>
+          <div class="muted" style="font-size:11px">${escapeHtml(a.contact_email || '—')}</div></td>
+        <td>${statusPill(a.status)}${a.notified_at ? ' <span class="muted" style="font-size:10px">· emailed</span>' : ''}</td>
+        <td>${reasonPill(a.reason)}</td>
+        <td><strong>${formatMicroUsd(+a.cost_24h_micro || 0)}</strong></td>
+        <td class="muted">${formatMicroUsd(+a.median_30d_micro || 0)}/d</td>
+        <td><strong>${fmtRatio(a.ratio)}</strong></td>
+        <td class="muted">${formatMicroUsd(+a.jump_micro || 0)}</td>
+        <td class="muted">${ago(a.detected_at)}<div style="font-size:10px">${fmtTime(a.detected_at)}</div></td>
+        <td>
+          ${a.status === 'open' ? `
+            <form method="POST" action="/admin/cost-anomalies/${a.id}/ack" style="display:inline">
+              <button type="submit" class="secondary" style="background:#1a4a1a;color:#7fff7f;border:0;padding:4px 10px;border-radius:3px;cursor:pointer;font-size:12px">Acknowledge</button>
+            </form>
+            <form method="POST" action="/admin/cost-anomalies/${a.id}/dismiss" style="display:inline" onsubmit="return confirm('Dismiss this anomaly? Use this for expected spikes (test traffic, new target onboarding).');">
+              <button type="submit" class="secondary" style="background:#1c2330;color:#e6edf3;border:0;padding:4px 10px;border-radius:3px;cursor:pointer;font-size:12px">Dismiss</button>
+            </form>
+          ` : `<a href="/admin/customers/${a.customer_id}" class="muted" style="font-size:12px">customer →</a>`}
+        </td>
+      </tr>
+    `).join('');
+
+    const openCount = q.rows.filter(a => a.status === 'open').length;
+    const ackCount  = q.rows.filter(a => a.status === 'acknowledged').length;
+    const dismissCount = q.rows.filter(a => a.status === 'dismissed').length;
+
+    const body = `
+      <h1>Classifier-spend anomalies</h1>
+      <div class="muted">Auto-detected by the cost_anomaly worker (hourly). Trigger: 10× ratio vs 30-day median, OR \$5+ absolute jump above median, gated by a \$1 floor. Acknowledge expected spikes; dismiss false-positives.</div>
+      ${flash}
+      <div class="row" style="display:flex;gap:14px;margin:18px 0">
+        <div class="card" style="flex:1 1 120px"><div class="muted">Open</div><div style="font-size:24px;font-weight:700;color:#d8902f">${openCount}</div></div>
+        <div class="card" style="flex:1 1 120px"><div class="muted">Acknowledged</div><div style="font-size:24px;font-weight:700;color:#cfe5ff">${ackCount}</div></div>
+        <div class="card" style="flex:1 1 120px"><div class="muted">Dismissed</div><div style="font-size:24px;font-weight:700;color:#8b949e">${dismissCount}</div></div>
+      </div>
+      ${q.rowCount ? `<table>
+        <thead><tr><th>Customer</th><th>Status</th><th>Trigger</th><th>24h spend</th><th>Median</th><th>Ratio</th><th>Jump</th><th>Detected</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>` : '<div class="muted" style="margin-top:18px">No anomalies in the last 60 days. The detector runs hourly when classifier traffic is present.</div>'}
+    `;
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(adminPage('cost-anomalies', body, req.operator));
+  });
+
+  r.post('/admin/cost-anomalies/:id/ack', gate, express.urlencoded({ extended: false }), async (req, res) => {
+    const ackName = req.operator?.name || req.operator?.email || 'admin';
+    await pool.query(
+      `UPDATE cost_anomalies SET status = 'acknowledged', acknowledged_by = $1, acknowledged_at = NOW() WHERE id = $2 AND status = 'open'`,
+      [ackName, req.params.id]
+    );
+    res.redirect('/admin/cost-anomalies?ok=Acknowledged');
+  });
+
+  r.post('/admin/cost-anomalies/:id/dismiss', gate, express.urlencoded({ extended: false }), async (req, res) => {
+    const ackName = req.operator?.name || req.operator?.email || 'admin';
+    await pool.query(
+      `UPDATE cost_anomalies SET status = 'dismissed', acknowledged_by = $1, acknowledged_at = NOW() WHERE id = $2 AND status = 'open'`,
+      [ackName, req.params.id]
+    );
+    res.redirect('/admin/cost-anomalies?ok=Dismissed');
   });
 
   // ── /admin/operators ──────────────────────────────────────────────

@@ -1,5 +1,5 @@
 {
-  "_README": "Copy this file to <campaign-slug>.json (e.g. jolly-for-governor.json), fill in the real values, and run `node scripts/provision-customer.js customers/<filename>`. Re-running with the same name updates an existing customer in place.",
+  "_README": "Copy this file to <campaign-slug>.json (e.g. jolly-for-governor.json), fill in the real values, and run `node scripts/provision-customer.js customers/<filename>`. Re-running with the same name updates an existing customer in place. CRITICAL: do NOT add bare-token aliases (single first or last names like 'Jolly' or 'Cinde'). The matcher is permissive by design — bare tokens trip on unrelated content (e.g., 'Jolly Sailors', 'Joe Warmington' for a different person same surname, Spanish 'Cristóbal' matching 'Crist'). Aliases should be either multi-token variants or unique full nicknames. Empty aliases array is preferred — search_terms drive ingest queries.",
   "name": "Campaign Display Name",
   "contact_email": "manager@example.com",
   "alert_email": "alerts@example.com",
@@ -10,13 +10,13 @@
     {
       "kind": "candidate",
       "name": "Full Candidate Name",
-      "aliases": ["LastName", "FirstName"],
+      "aliases": [],
       "search_terms": ["Full Candidate Name", "Campaign Slogan"]
     },
     {
       "kind": "family",
       "name": "Spouse Full Name",
-      "aliases": ["LastName"],
+      "aliases": [],
       "search_terms": ["Spouse Full Name"]
     },
     {

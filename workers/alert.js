@@ -25,7 +25,7 @@ async function loadRoutes(pool, customerId, tier) {
   // Channel-aware: email + webhook + future SMS.
   const r = await pool.query(`
     SELECT id, channel, destination, secret, label FROM alert_routes
-    WHERE customer_id = $1 AND active = TRUE AND min_tier <= $2 AND channel IN ('email', 'webhook')
+    WHERE customer_id = $1 AND active = TRUE AND min_tier <= $2 AND channel IN ('email', 'webhook', 'slack')
   `, [customerId, tier]);
   if (r.rowCount > 0) return r.rows;
   // Fall back to customer.alert_email as a single email route.

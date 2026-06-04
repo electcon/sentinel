@@ -173,6 +173,40 @@ async function initSchema(pool) {
       created_at    TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+  // Per-call token usage + cost tracking. Cost in micro-USD (1e-6 USD)
+  // for stable integer math across thousands of rows. customer_id is
+  // denormalized off mentions.customer_id so cost rollups skip the join.
+  await pool.query(`ALTER TABLE classifications ADD COLUMN IF NOT EXISTS input_tokens INTEGER`);
+  await pool.query(`ALTER TABLE classifications ADD COLUMN IF NOT EXISTS output_tokens INTEGER`);
+  await pool.query(`ALTER TABLE classifications ADD COLUMN IF NOT EXISTS cache_read_tokens INTEGER`);
+  await pool.query(`ALTER TABLE classifications ADD COLUMN IF NOT EXISTS cache_creation_tokens INTEGER`);
+  await pool.query(`ALTER TABLE classifications ADD COLUMN IF NOT EXISTS cost_usd_micro INTEGER`);
+  await pool.query(`ALTER TABLE classifications ADD COLUMN IF NOT EXISTS customer_id UUID`);
+  // Cost rollup index — most queries filter customer_id + created_at range.
+  await pool.query(`CREATE INDEX IF NOT EXISTS classifications_cost_rollup ON classifications (customer_id, created_at DESC) WHERE cost_usd_micro IS NOT NULL`);
+
+  // Detected classifier-spend anomalies. Worker writes one row per
+  // detection; status moves open → acknowledged when an operator
+  // visits the row in /admin/cost-anomalies.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS cost_anomalies (
+      id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      customer_id        UUID NOT NULL REFERENCES customers(id),
+      detected_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      cost_24h_micro     BIGINT NOT NULL,
+      median_30d_micro   BIGINT NOT NULL,
+      ratio              NUMERIC,           -- nullable when median was 0
+      jump_micro         BIGINT NOT NULL,
+      reason             TEXT NOT NULL,     -- 'ratio' | 'abs_jump'
+      notified_at        TIMESTAMPTZ,
+      status             TEXT NOT NULL DEFAULT 'open',  -- 'open' | 'acknowledged' | 'dismissed'
+      acknowledged_by    TEXT,
+      acknowledged_at    TIMESTAMPTZ,
+      notes              TEXT
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS cost_anomalies_open ON cost_anomalies (detected_at DESC) WHERE status = 'open'`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS cost_anomalies_customer ON cost_anomalies (customer_id, detected_at DESC)`);
 
   // Classifier feedback. Every reviewer disposition (Tier-2 review queue
   // action OR Tier-3+ threat_event status change) is captured here as

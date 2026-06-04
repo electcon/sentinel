@@ -107,7 +107,13 @@ async function _callAnthropic(model, userPrompt, opts) {
     messages: [{ role: 'user', content: userPrompt }]
   });
   const text = (res.content || []).map(b => b.type === 'text' ? b.text : '').join('').trim();
-  return _parseClassifierOutput(text, model, t0);
+  const usage = res.usage ? {
+    input_tokens:    +res.usage.input_tokens   || 0,
+    output_tokens:   +res.usage.output_tokens  || 0,
+    cache_read:      +res.usage.cache_read_input_tokens     || 0,
+    cache_creation:  +res.usage.cache_creation_input_tokens || 0
+  } : null;
+  return _parseClassifierOutput(text, model, t0, usage);
 }
 
 // OpenRouter classifier path. Uses any model exposed via openrouter.ai
@@ -144,10 +150,17 @@ async function _callOpenRouter(model, userPrompt, opts) {
   }
   const j = await r.json();
   const text = (j?.choices?.[0]?.message?.content || '').trim();
-  return _parseClassifierOutput(text, useModel, t0);
+  // OpenRouter exposes prompt_tokens / completion_tokens in OpenAI-compat shape.
+  const usage = j?.usage ? {
+    input_tokens:    +j.usage.prompt_tokens     || 0,
+    output_tokens:   +j.usage.completion_tokens || 0,
+    cache_read:      0,
+    cache_creation:  0
+  } : null;
+  return _parseClassifierOutput(text, useModel, t0, usage);
 }
 
-function _parseClassifierOutput(text, modelLabel, t0) {
+function _parseClassifierOutput(text, modelLabel, t0, usage) {
   const jsonStr = extractFirstJsonObject(text);
   let parsed;
   try { parsed = JSON.parse(jsonStr); }
@@ -156,7 +169,8 @@ function _parseClassifierOutput(text, modelLabel, t0) {
       tier: 2, confidence: 0, sentiment: 0,
       rationale: 'classifier returned unparseable output — see raw',
       raw: text, model: modelLabel, prompt_v: PROMPT_V,
-      ms: Date.now() - t0, parse_error: true
+      ms: Date.now() - t0, parse_error: true,
+      usage: usage || null
     };
   }
   let tier = Math.max(1, Math.min(4, parseInt(parsed.tier, 10) || 1));
@@ -167,7 +181,8 @@ function _parseClassifierOutput(text, modelLabel, t0) {
     sentiment: typeof parsed.sentiment === 'number' ? parsed.sentiment : 0,
     rationale: String(parsed.rationale || '').slice(0, 200),
     raw: parsed, model: modelLabel, prompt_v: PROMPT_V,
-    ms: Date.now() - t0
+    ms: Date.now() - t0,
+    usage: usage || null
   };
 }
 

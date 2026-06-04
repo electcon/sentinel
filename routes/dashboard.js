@@ -181,6 +181,7 @@ ${customer ? `
   <div class="links">
     ${navLink('/dashboard', 'overview', 'overview')}
     ${navLink('/dashboard/threats', 'threats', 'threats')}
+    ${navLink('/dashboard/live', 'live', 'live')}
     ${navLink('/dashboard/review-queue', 'review queue', 'review-queue', reviewCount > 0 ? reviewCount : null)}
     ${navLink('/dashboard/mentions', 'mentions', 'mentions')}
     ${navLink('/dashboard/settings', 'settings', 'settings')}
@@ -479,7 +480,7 @@ function build(pool) {
             </ul>
             <p style="margin:0 0 4px"><strong>Next steps:</strong></p>
             <ul style="margin:0 0 4px;padding-left:20px">
-              <li>Visit <a href="/dashboard/settings">Settings</a> to add team-member emails or webhook routes (Slack/PagerDuty/etc.)</li>
+              <li>Visit <a href="/dashboard/settings">Settings</a> to add team-member emails, a native Slack webhook URL, or HMAC-signed JSON webhooks (PagerDuty / Discord / custom)</li>
               <li>Refresh this page in 30 minutes to see initial activity</li>
               <li>Daily digest emails arrive every morning even on quiet days</li>
             </ul>
@@ -560,6 +561,212 @@ function build(pool) {
     res.send(layout({ title: 'Overview', customer: req.customer, body, active: 'overview' }));
   });
 
+  // ── Live mentions stream (Server-Sent Events) ─────────────────────
+  // Polls the DB every ~3s for new mentions for this customer, streams
+  // them as SSE events. The /dashboard/live page below consumes this.
+  // Watchdog: max 1 hour per connection, then client reconnects via
+  // EventSource auto-retry.
+  r.get('/dashboard/stream', authed, async (req, res) => {
+    res.set({
+      'Content-Type':  'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection':    'keep-alive',
+      'X-Accel-Buffering': 'no'
+    });
+    res.flushHeaders?.();
+
+    const customerId = req.customer.id;
+    let lastIdSeen = req.query.cursor || null;
+    let alive = true;
+    req.on('close', () => { alive = false; });
+
+    // Initial cursor: highest id at connect time. We only stream NEW mentions.
+    if (!lastIdSeen) {
+      try {
+        const init = await pool.query('SELECT id FROM mentions WHERE customer_id = $1 ORDER BY id DESC LIMIT 1', [customerId]);
+        lastIdSeen = init.rows[0]?.id || '00000000-0000-0000-0000-000000000000';
+      } catch (_) { lastIdSeen = '00000000-0000-0000-0000-000000000000'; }
+    }
+    res.write(`event: hello\ndata: ${JSON.stringify({ cursor: lastIdSeen, ts: Date.now() })}\n\n`);
+
+    const POLL_MS = 3000;
+    const HEARTBEAT_MS = 25_000;
+    const MAX_LIFETIME_MS = 60 * 60 * 1000;
+    const startedAt = Date.now();
+
+    let lastHeartbeat = Date.now();
+    while (alive && Date.now() - startedAt < MAX_LIFETIME_MS) {
+      try {
+        const q = await pool.query(`
+          SELECT m.id, m.threat_tier, m.tier_bumped, m.original_tier,
+                 m.source, m.source_url, m.author_handle, m.posted_at, m.ingested_at,
+                 m.body_excerpt, m.rationale,
+                 t.name AS target_name, t.kind AS target_kind
+          FROM mentions m
+          LEFT JOIN targets t ON t.id = m.target_id
+          WHERE m.customer_id = $1 AND m.id > $2
+          ORDER BY m.id ASC
+          LIMIT 50
+        `, [customerId, lastIdSeen]);
+        if (q.rowCount > 0) {
+          for (const m of q.rows) {
+            if (!alive) break;
+            res.write(`event: mention\ndata: ${JSON.stringify({
+              id: m.id,
+              tier: m.threat_tier,
+              tier_bumped: m.tier_bumped,
+              original_tier: m.original_tier,
+              source: m.source,
+              source_url: m.source_url,
+              author: m.author_handle,
+              posted_at: m.posted_at,
+              ingested_at: m.ingested_at,
+              body_excerpt: (m.body_excerpt || '').slice(0, 400),
+              rationale: m.rationale || '',
+              target_name: m.target_name,
+              target_kind: m.target_kind
+            })}\n\n`);
+            lastIdSeen = m.id;
+          }
+        }
+        if (Date.now() - lastHeartbeat > HEARTBEAT_MS) {
+          res.write(`event: heartbeat\ndata: ${JSON.stringify({ ts: Date.now(), cursor: lastIdSeen })}\n\n`);
+          lastHeartbeat = Date.now();
+        }
+      } catch (e) {
+        if (alive) res.write(`event: error\ndata: ${JSON.stringify({ message: e.message.slice(0, 200) })}\n\n`);
+        break;
+      }
+      await new Promise(r => setTimeout(r, POLL_MS));
+    }
+    try { res.write(`event: close\ndata: {"reason":"server-rotate"}\n\n`); res.end(); }
+    catch (_) {}
+  });
+
+  // ── Live mention tail UI ──────────────────────────────────────────
+  // Consumer for the SSE stream above. Renders newest mentions at top.
+  r.get('/dashboard/live', authed, async (req, res) => {
+    const body = `
+      <h1>Live mentions</h1>
+      <div class="muted" style="margin-bottom:14px">Real-time tail. New mentions appear at the top as they're ingested + classified — typical latency ${'<'}30s for Bluesky firehose, 5–15 min for poll-based sources.</div>
+      <div id="status" style="display:flex;align-items:center;gap:10px;background:#0e1422;border:1px solid #1c2330;padding:10px 14px;border-radius:6px;margin-bottom:18px;font-size:13px">
+        <span id="dot" style="width:10px;height:10px;border-radius:50%;background:#5b6573;display:inline-block"></span>
+        <span id="state">connecting…</span>
+        <span style="margin-left:auto;color:#8b949e" id="counter">0 mentions seen</span>
+        <button id="pauseBtn" type="button" style="background:#1c2330;color:#e6edf3;border:0;padding:5px 10px;border-radius:3px;font-size:12px;cursor:pointer">Pause</button>
+      </div>
+      <div id="feed"></div>
+      <script>
+      (function() {
+        var feed = document.getElementById('feed');
+        var dot = document.getElementById('dot');
+        var state = document.getElementById('state');
+        var counter = document.getElementById('counter');
+        var pauseBtn = document.getElementById('pauseBtn');
+        var seen = 0;
+        var paused = false;
+        var es = null;
+        function tierColor(t) {
+          if (t === 4) return '#7a1019';
+          if (t === 3) return '#a04400';
+          if (t === 2) return '#7a4a0a';
+          return '#1c2330';
+        }
+        function tierFg(t) {
+          if (t === 4) return '#ff7080';
+          if (t === 3) return '#e57e3a';
+          if (t === 2) return '#d8902f';
+          return '#8b949e';
+        }
+        function esc(s) {
+          return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+        }
+        function appendMention(m) {
+          if (paused) return;
+          seen++;
+          counter.textContent = seen + ' mentions seen';
+          var div = document.createElement('div');
+          div.style.cssText = 'background:#0e1422;border:1px solid #1c2330;border-left:3px solid ' + tierColor(m.tier) + ';padding:12px 14px;border-radius:4px;margin-bottom:10px;animation:flash 1.5s ease-out';
+          var bumpBadge = m.tier_bumped ? ' <span style="background:#5e0e16;color:#ff7f7f;padding:1px 5px;border-radius:2px;font-size:9px;font-weight:600">BUMPED from T' + m.original_tier + '</span>' : '';
+          var html = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:13px">' +
+            '<span style="background:' + tierColor(m.tier) + ';color:' + tierFg(m.tier) + ';padding:2px 8px;border-radius:3px;font-weight:600;font-size:11px">T' + (m.tier || '—') + '</span>' +
+            bumpBadge +
+            ' <strong>' + esc(m.target_name || 'unknown target') + '</strong>' +
+            ' <span style="color:#8b949e">via ' + esc(m.source) + '</span>' +
+            ' <span style="color:#8b949e">·</span> <span style="color:#cdd5e0">' + esc(m.author || 'unknown') + '</span>' +
+            ' <span style="margin-left:auto;color:#5b6573;font-size:11px">just now</span>' +
+            '</div>' +
+            '<div style="font-size:13px;color:#cdd5e0;white-space:pre-wrap;margin-bottom:6px">' + esc((m.body_excerpt || '').slice(0, 300)) + '</div>' +
+            (m.rationale ? '<div style="font-size:11px;color:#8b949e;margin-bottom:6px"><em>' + esc(m.rationale) + '</em></div>' : '') +
+            (m.source_url ? '<a href="' + esc(m.source_url) + '" target="_blank" rel="noopener" style="font-size:11px;color:#4f9af0">view source ↗</a>' : '');
+          div.innerHTML = html;
+          feed.insertBefore(div, feed.firstChild);
+          while (feed.children.length > 200) feed.removeChild(feed.lastChild);
+        }
+        function setState(connected, label) {
+          dot.style.background = connected ? '#3a9c3a' : '#a82a2a';
+          state.textContent = label;
+        }
+        function connect() {
+          es = new EventSource('/dashboard/stream');
+          es.addEventListener('hello', function() { setState(true, 'connected · waiting for mentions'); });
+          es.addEventListener('mention', function(e) {
+            try { appendMention(JSON.parse(e.data)); } catch (_) {}
+          });
+          es.addEventListener('heartbeat', function() { /* keep-alive */ });
+          es.addEventListener('close', function() { setState(false, 'reconnecting…'); });
+          es.onerror = function() { setState(false, 'connection lost — auto-retrying'); };
+        }
+        pauseBtn.addEventListener('click', function() {
+          paused = !paused;
+          pauseBtn.textContent = paused ? 'Resume' : 'Pause';
+          pauseBtn.style.background = paused ? '#3d301a' : '#1c2330';
+          pauseBtn.style.color      = paused ? '#d8902f' : '#e6edf3';
+        });
+        connect();
+      })();
+      </script>
+      <style>
+        @keyframes flash {
+          0%   { background: #1a3a5c; }
+          100% { background: #0e1422; }
+        }
+      </style>
+    `;
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(layout({ title: 'Live mentions', customer: req.customer, body, active: 'live' }));
+  });
+
+  // ── Threats CSV export ─────────────────────────────────────────────
+  r.get('/dashboard/threats.csv', authed, async (req, res) => {
+    const valid = STATUS_OPTIONS.map(s => s.value).concat(['all']);
+    const useStatus = valid.includes(req.query.status) ? req.query.status : 'all';
+    const where = useStatus === 'all' ? '' : `AND te.status = $2`;
+    const args = useStatus === 'all' ? [req.customer.id] : [req.customer.id, useStatus];
+    const r2 = await pool.query(`
+      SELECT te.id, te.tier, te.status, te.created_at, te.alerted_at, te.resolved_at, te.notes,
+             m.posted_at, m.body_excerpt, m.source, m.source_url, m.author_handle, m.s3_key,
+             t.name AS target_name, t.kind AS target_kind
+      FROM threat_events te
+      JOIN mentions m ON m.id = te.mention_id
+      LEFT JOIN targets t ON t.id = te.target_id
+      WHERE te.customer_id = $1 ${where}
+      ORDER BY te.tier DESC, te.created_at DESC
+      LIMIT 5000
+    `, args);
+    const { csvField, csvRow } = require('./api');
+    const filename = `sentinel-threats-${new Date().toISOString().slice(0, 10)}.csv`;
+    res.set('Content-Type', 'text/csv; charset=utf-8');
+    res.set('Content-Disposition', `attachment; filename="${filename}"`);
+    res.write(csvRow(['id','tier','status','created_at','alerted_at','resolved_at','target_name','target_kind','source','source_url','author_handle','posted_at','body_excerpt','s3_key','notes']));
+    for (const t of r2.rows) {
+      res.write(csvRow([t.id, t.tier, t.status, t.created_at, t.alerted_at, t.resolved_at,
+        t.target_name, t.target_kind, t.source, t.source_url, t.author_handle, t.posted_at,
+        t.body_excerpt, t.s3_key, t.notes]));
+    }
+    res.end();
+  });
+
   // ── Threat queue (full list, all statuses) ─────────────────────────
   r.get('/dashboard/threats', authed, async (req, res) => {
     const status = req.query.status || 'all';
@@ -597,9 +804,10 @@ function build(pool) {
 
     const body = `
       <h1>Threat queue</h1>
-      <div style="margin:16px 0">
+      <div style="margin:16px 0;display:flex;align-items:center;flex-wrap:wrap;gap:6px">
         ${filterPill('all', 'all')}
         ${STATUS_OPTIONS.map(s => filterPill(s.value, s.label)).join('')}
+        <a href="/dashboard/threats.csv${useStatus !== 'all' ? '?status=' + useStatus : ''}" style="margin-left:auto"><button type="button" class="secondary">↓ Export threats CSV</button></a>
       </div>
       ${r2.rowCount ? `<table>
         <thead><tr><th>Tier</th><th>Target</th><th>Source</th><th>Excerpt</th><th>Detected</th><th>Status</th><th></th></tr></thead>
@@ -1510,10 +1718,10 @@ ${reviewRows}
     const targetRows = targets.rows.map(t => `
       <tr>
         <td><span class="status-pill">${escapeHtml(t.kind || 'candidate')}</span></td>
-        <td><strong>${escapeHtml(t.name)}</strong></td>
+        <td><a href="/dashboard/targets/${t.id}/activity"><strong>${escapeHtml(t.name)}</strong></a></td>
         <td>${escapeHtml((Array.isArray(t.aliases) ? t.aliases : []).join(', ') || '—')}</td>
         <td>${escapeHtml((Array.isArray(t.search_terms) ? t.search_terms : []).join(', ') || '—')}</td>
-        <td><a href="/dashboard/targets/${t.id}">edit</a></td>
+        <td><a href="/dashboard/targets/${t.id}/activity">activity</a> · <a href="/dashboard/targets/${t.id}">edit</a></td>
         <td>
           <form method="POST" action="/dashboard/targets/${t.id}/delete" onsubmit="return confirm('Delete target ${escapeHtml(t.name)}? This stops monitoring it but does not delete past mentions.');" style="display:inline">
             <button type="submit" class="danger" style="padding:4px 8px;font-size:12px">delete</button>
@@ -1554,7 +1762,7 @@ ${reviewRows}
 
       <h2>Alert routes</h2>
       <div class="muted" style="font-size:13px;margin-bottom:10px">
-        Route Tier-3+ alerts to additional destinations (Slack/PagerDuty/Discord webhook, extra emails).
+        Route Tier-3+ alerts to additional destinations: native Slack (paste an incoming-webhook URL — no receiver to deploy), HMAC-signed JSON webhook (PagerDuty / Discord / custom), or extra emails.
         If no routes are configured here, alerts go to <code style="background:#0a0f1a;padding:2px 6px;border-radius:3px">${escapeHtml(req.customer.alert_email || 'alert email below')}</code>.
       </div>
       ${await renderAlertRoutes(pool, req.customer.id)}
@@ -1565,12 +1773,13 @@ ${reviewRows}
             <label for="channel">Channel</label>
             <select id="channel" name="channel" style="background:#0a0f1a;border:1px solid #1c2330;color:#e6edf3;padding:10px;border-radius:4px;width:100%;font-size:14px">
               <option value="email">email</option>
-              <option value="webhook">webhook (Slack / PagerDuty / Discord / custom)</option>
+              <option value="slack">Slack (paste your incoming-webhook URL — no receiver to deploy)</option>
+              <option value="webhook">webhook (PagerDuty / Discord / custom — HMAC-signed JSON envelope)</option>
             </select>
           </div>
           <div class="field">
-            <label for="destination">Destination (email address OR webhook URL)</label>
-            <input id="destination" name="destination" type="text" required placeholder="ops@campaign.com  OR  https://hooks.slack.com/services/..." style="font-size:13px;font-family:monospace">
+            <label for="destination">Destination (email · Slack URL · webhook URL)</label>
+            <input id="destination" name="destination" type="text" required placeholder="ops@campaign.com  ·  https://hooks.slack.com/services/...  ·  https://your-receiver.example.com/sentinel-alert" style="font-size:13px;font-family:monospace">
           </div>
           <div class="field">
             <label for="label">Label (optional, for your reference)</label>
@@ -1666,10 +1875,13 @@ ${reviewRows}
     const destination = (req.body.destination || '').trim();
     const label = (req.body.label || '').trim() || null;
     const minTier = parseInt(req.body.min_tier, 10) || 3;
-    if (!['email', 'webhook'].includes(channel)) return res.redirect('/dashboard/settings?err=Invalid+channel');
+    if (!['email', 'webhook', 'slack'].includes(channel)) return res.redirect('/dashboard/settings?err=Invalid+channel');
     if (!destination) return res.redirect('/dashboard/settings?err=Destination+required');
     if (channel === 'email' && !/.+@.+\..+/.test(destination)) return res.redirect('/dashboard/settings?err=Invalid+email');
     if (channel === 'webhook' && !/^https?:\/\//i.test(destination)) return res.redirect('/dashboard/settings?err=Webhook+URL+must+start+with+http(s)');
+    if (channel === 'slack' && !/^https:\/\/hooks\.slack\.com\/services\//i.test(destination)) {
+      return res.redirect('/dashboard/settings?err=' + encodeURIComponent('Slack URL must be https://hooks.slack.com/services/...'));
+    }
     if (![3, 4].includes(minTier)) return res.redirect('/dashboard/settings?err=Invalid+tier');
     const secret = channel === 'webhook' ? generateWebhookSecret() : null;
     await pool.query(`
@@ -1762,16 +1974,132 @@ ${reviewRows}
     res.redirect('/dashboard/settings?ok=Target+saved');
   });
 
+  // Per-target activity drill-down: 30-day volume, tier breakdown,
+  // top hostile authors for THIS target, recent mentions. Distinct
+  // from the bare edit form at /dashboard/targets/:id.
+  r.get('/dashboard/targets/:id/activity', authed, async (req, res) => {
+    const tq = await pool.query(`SELECT id, kind, name, aliases, search_terms FROM targets WHERE id = $1 AND customer_id = $2`, [req.params.id, req.customer.id]);
+    if (!tq.rowCount) return res.status(404).send('not found');
+    const t = tq.rows[0];
+
+    const [vol30, tierMix, topAuthors, recent] = await Promise.all([
+      pool.query(`
+        SELECT (DATE_TRUNC('day', ingested_at AT TIME ZONE 'UTC'))::date AS day,
+               COUNT(*)::int AS n
+        FROM mentions
+        WHERE customer_id = $1 AND target_id = $2 AND ingested_at > NOW() - INTERVAL '30 days'
+        GROUP BY 1 ORDER BY 1
+      `, [req.customer.id, t.id]),
+      pool.query(`
+        SELECT threat_tier, COUNT(*)::int AS n
+        FROM mentions
+        WHERE customer_id = $1 AND target_id = $2 AND ingested_at > NOW() - INTERVAL '30 days'
+          AND threat_tier IS NOT NULL
+        GROUP BY 1 ORDER BY 1 DESC
+      `, [req.customer.id, t.id]),
+      pool.query(`
+        SELECT author_handle, source,
+               COUNT(*)::int AS total,
+               COUNT(*) FILTER (WHERE threat_tier >= 2)::int AS bad_count,
+               MAX(ingested_at) AS last_seen
+        FROM mentions
+        WHERE customer_id = $1 AND target_id = $2
+          AND author_handle IS NOT NULL AND author_handle <> ''
+          AND ingested_at > NOW() - INTERVAL '30 days'
+        GROUP BY 1, 2
+        ORDER BY bad_count DESC, total DESC
+        LIMIT 10
+      `, [req.customer.id, t.id]),
+      pool.query(`
+        SELECT id, threat_tier, tier_bumped, source, source_url, posted_at, body_excerpt, author_handle
+        FROM mentions
+        WHERE customer_id = $1 AND target_id = $2
+        ORDER BY ingested_at DESC LIMIT 50
+      `, [req.customer.id, t.id])
+    ]);
+
+    const totalMentions30d = vol30.rows.reduce((s, r) => s + r.n, 0);
+    const tierCounts = { 4: 0, 3: 0, 2: 0, 1: 0 };
+    for (const r of tierMix.rows) tierCounts[r.threat_tier] = r.n;
+    const t4 = tierCounts[4] || 0, t3 = tierCounts[3] || 0, t2 = tierCounts[2] || 0;
+
+    // Compact ASCII bar chart for volume.
+    const maxN = Math.max(...vol30.rows.map(r => r.n), 1);
+    const chart = vol30.rows.map(r => {
+      const h = Math.max(2, Math.round((r.n / maxN) * 60));
+      const day = r.day instanceof Date ? r.day : new Date(r.day);
+      return `<div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;min-width:0">
+        <div style="background:#4f9af0;width:80%;height:${h}px;border-radius:2px 2px 0 0" title="${day.toISOString().slice(0,10)}: ${r.n}"></div>
+        <div class="muted" style="font-size:9px;margin-top:2px">${day.getUTCDate()}</div>
+      </div>`;
+    }).join('');
+
+    const authorRows = topAuthors.rows.map(a => {
+      const flagged = a.bad_count >= 3;
+      return `<tr>
+        <td><a href="/dashboard/authors/${encodeURIComponent(a.author_handle)}"><strong>${escapeHtml(a.author_handle)}</strong></a>${flagged ? ' <span style="background:#5e0e16;color:#ff7f7f;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600">REPEAT</span>' : ''}</td>
+        <td>${escapeHtml(a.source)}</td>
+        <td><strong>${a.bad_count}</strong> <span class="muted">T2+ / ${a.total} total</span></td>
+        <td class="muted">${ago(a.last_seen)}</td>
+      </tr>`;
+    }).join('');
+
+    const recentRows = recent.rows.map(m => `<tr>
+      <td>T${m.threat_tier || '—'}${m.tier_bumped ? ' <span style="background:#5e0e16;color:#ff7f7f;padding:1px 5px;border-radius:2px;font-size:9px;font-weight:600">BUMP</span>' : ''}</td>
+      <td>${escapeHtml(m.source)}</td>
+      <td>${escapeHtml(m.author_handle || '—')}</td>
+      <td>${escapeHtml((m.body_excerpt || '').slice(0, 140))}</td>
+      <td class="muted">${ago(m.posted_at)}</td>
+      <td>${m.source_url ? `<a href="${escapeHtml(m.source_url)}" target="_blank" rel="noopener">↗</a>` : ''}</td>
+    </tr>`).join('');
+
+    const aliases = Array.isArray(t.aliases) ? t.aliases : [];
+    const terms = Array.isArray(t.search_terms) ? t.search_terms : [];
+    const kindBadge = t.kind === 'opponent'
+      ? '<span style="background:#3d2050;color:#c89dff;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:600">OPPONENT</span>'
+      : `<span class="muted">${escapeHtml(t.kind)}</span>`;
+
+    const body = `
+      <a href="/dashboard/settings" class="muted">← all targets</a>
+      <h1 style="margin-top:14px">${escapeHtml(t.name)}</h1>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:18px">
+        ${kindBadge}
+        ${aliases.length ? `<span class="muted" style="font-size:13px">aliases: ${aliases.map(a => `<code style="background:#0e1422;padding:1px 6px;border-radius:2px;font-size:12px">${escapeHtml(a)}</code>`).join(' ')}</span>` : ''}
+        <a href="/dashboard/targets/${t.id}" style="margin-left:auto;color:#4f9af0;font-size:13px">edit →</a>
+      </div>
+      ${terms.length ? `<div class="muted" style="font-size:12px;margin-bottom:18px">search terms: ${terms.map(s => `<code style="background:#0e1422;padding:1px 6px;border-radius:2px;font-size:12px">${escapeHtml(s)}</code>`).join(' ')}</div>` : ''}
+
+      <div class="row" style="display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap">
+        <div class="card" style="flex:1 1 140px"><div class="muted">Last 30 days</div><div style="font-size:24px;font-weight:700">${totalMentions30d}</div><div class="muted" style="font-size:11px">mentions ingested</div></div>
+        <div class="card" style="flex:1 1 100px"><div class="muted">T4</div><div style="font-size:22px;font-weight:600;color:#ff7f7f">${t4}</div></div>
+        <div class="card" style="flex:1 1 100px"><div class="muted">T3</div><div style="font-size:22px;font-weight:600;color:#e57e3a">${t3}</div></div>
+        <div class="card" style="flex:1 1 100px"><div class="muted">T2</div><div style="font-size:22px;font-weight:600;color:#d8902f">${t2}</div></div>
+      </div>
+
+      <h2 style="font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:#5b6573;margin:24px 0 8px">Volume — last 30 days</h2>
+      ${vol30.rowCount ? `<div style="display:flex;align-items:flex-end;gap:1px;height:80px;background:#0e1422;border:1px solid #1c2330;border-radius:6px;padding:8px;margin-bottom:18px">${chart}</div>` : '<div class="muted" style="margin-bottom:18px">No mentions in window.</div>'}
+
+      <h2 style="font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:#5b6573;margin:24px 0 8px">Top hostile authors — last 30 days</h2>
+      ${topAuthors.rowCount ? `<table style="font-size:13px"><thead><tr><th>Author</th><th>Source</th><th>Activity</th><th>Last seen</th></tr></thead><tbody>${authorRows}</tbody></table>` : '<div class="muted">No authors with multiple mentions of this target yet.</div>'}
+
+      <h2 style="font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:#5b6573;margin:24px 0 8px">Recent mentions (50)</h2>
+      ${recent.rowCount ? `<table style="font-size:13px"><thead><tr><th>Tier</th><th>Source</th><th>Author</th><th>Excerpt</th><th>Posted</th><th></th></tr></thead><tbody>${recentRows}</tbody></table>` : '<div class="muted">No mentions yet.</div>'}
+    `;
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(layout({ title: t.name, customer: req.customer, body, active: 'settings' }));
+  });
+
   r.get('/dashboard/targets/:id', authed, async (req, res) => {
     const q = await pool.query(`SELECT id, kind, name, aliases, search_terms FROM targets WHERE id = $1 AND customer_id = $2`, [req.params.id, req.customer.id]);
     if (!q.rowCount) return res.status(404).send('not found');
     const t = q.rows[0];
-    const body = renderTargetForm({
+    const body = `<a href="/dashboard/targets/${t.id}/activity" class="muted">← target activity</a>
+${renderTargetForm({
       kind: t.kind || 'candidate',
       name: t.name,
       aliases: Array.isArray(t.aliases) ? t.aliases : [],
       search_terms: Array.isArray(t.search_terms) ? t.search_terms : []
-    }, `/dashboard/targets/${t.id}`, 'Edit target');
+    }, `/dashboard/targets/${t.id}`, 'Edit target')}`;
     res.set('Content-Type', 'text/html; charset=utf-8');
     res.send(layout({ title: 'Edit target', customer: req.customer, body, active: 'settings' }));
   });
@@ -1874,7 +2202,9 @@ async function renderAlertRoutes(pool, customerId) {
   };
   const rows = q.rows.map(r => {
     const isWebhook = r.channel === 'webhook';
-    const channelPill = `<span class="status-pill" style="background:${isWebhook ? '#1a3a5c' : '#1c2330'};color:#cfe5ff">${escapeHtml(r.channel)}</span>`;
+    const isSlack = r.channel === 'slack';
+    const pillBg = isWebhook ? '#1a3a5c' : isSlack ? '#3a1a5c' : '#1c2330';
+    const channelPill = `<span class="status-pill" style="background:${pillBg};color:#cfe5ff">${escapeHtml(r.channel)}</span>`;
     const active = r.active ? '<span class="status-pill" style="background:#1a4a1a;color:#7fff7f">active</span>' : '<span class="status-pill" style="background:#3d301a;color:#d8902f">paused</span>';
     const secretBlock = isWebhook && r.secret ? `<div class="muted" style="margin-top:6px;font-size:12px">
       <strong>HMAC secret</strong> (verify <code>X-Sentinel-Signature: sha256=&lt;hmac&gt;</code> against the request body):

@@ -5,8 +5,19 @@ own systems (SIEM, Slack bots, custom dashboards, audit pipelines).
 
 **Base URL:** `https://sentinel.parallaxadvisory.llc/api/v1`
 **Auth:** `Authorization: Bearer sk_<32 hex chars>`
-**Rate limit:** 60 requests/minute per API key
+**Rate limit:** 60 requests/minute per API key (token bucket; refills continuously)
 **Versioning:** Path-versioned (`/api/v1/`); we bump to `/v2` for breaking changes
+
+### Rate-limit response headers
+
+Every authenticated response — both `2xx` and `429` — includes:
+
+| Header | Meaning |
+|---|---|
+| `X-RateLimit-Limit` | Cap (`60`) |
+| `X-RateLimit-Remaining` | Tokens left in your bucket after this request (floor) |
+| `X-RateLimit-Reset` | Unix epoch (seconds) when bucket would be fully refilled |
+| `Retry-After` | Seconds to wait before retry — only set on `429` |
 
 ## Authentication
 
@@ -46,6 +57,21 @@ curl https://sentinel.parallaxadvisory.llc/api/v1/customer \
   ]
 }
 ```
+
+### `GET /api/v1/mentions.csv` — bulk CSV export
+
+Same filters as `/mentions` (`tier`, `source`, `since`) but no pagination —
+single response, capped at 5000 rows. Streams `text/csv; charset=utf-8`
+with a `Content-Disposition: attachment` header. RFC 4180 quoting on
+fields containing comma / double-quote / newline. Useful for SIEM
+imports, audit packets, ad-hoc spreadsheet review.
+
+```bash
+curl 'https://sentinel.parallaxadvisory.llc/api/v1/mentions.csv?since=2026-04-01' \
+  -H "Authorization: Bearer $SENTINEL_API_KEY" -o mentions.csv
+```
+
+A symmetric `/api/v1/threats.csv` export exists for the threat queue.
 
 ### `GET /api/v1/mentions` — paginated mention list
 
@@ -119,6 +145,7 @@ curl "https://sentinel.parallaxadvisory.llc/api/v1/authors/$(printf %s 'someone'
 
 All errors return JSON: `{ "error": "<human-readable message>" }`.
 
+- `400` — malformed input (`cursor` or `:id` must be a UUID; bad query params)
 - `401` — missing / bad / revoked / customer-suspended API key
 - `404` — resource not found OR not owned by your customer
 - `429` — rate limit (60 req/min/key); `Retry-After` header indicates wait time

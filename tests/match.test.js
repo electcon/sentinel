@@ -40,6 +40,20 @@ test('matchOne: no match when alias is part of a larger word', () => {
   assert.ok(!matchOne('preLaubacher', 'Laubacher'));
 });
 
+test('matchOne: Unicode boundary — accented letter is part of word', () => {
+  // Pre-Unicode-fix the boundary regex was [^A-Za-z0-9], so 'ó' read as a
+  // non-word char and "Cristóbal" matched alias "Crist". Real false
+  // positives observed in production Bluesky digest. Now /u + \p{L}\p{N}
+  // treats 'ó' / 'ã' / 'ñ' / etc. as letters, so the boundary fails.
+  assert.ok(!matchOne('Cristóbal Colón fundó la ciudad', 'Crist'));
+  assert.ok(!matchOne('um cristão devoto', 'Crist'));
+  assert.ok(!matchOne('Maria Cristina Núñez', 'Crist'));
+  // Sanity: still matches when the surrounding char IS a non-letter
+  // (the original test contract — "Crist" alone in punctuated text).
+  assert.ok(matchOne('abans de Crist, the city', 'Crist'));
+  assert.ok(matchOne('"Crist" is the alias', 'Crist'));
+});
+
 test('matchOne: rejects too-short aliases', () => {
   // 1-char aliases rejected to prevent absurd false-positive volume.
   assert.ok(!matchOne('I said yes', 'I'));
