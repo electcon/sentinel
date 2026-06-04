@@ -727,6 +727,8 @@ app.get('/', async (req, res) => {
 <div class="nav">
   <div class="brand">SENTINEL</div>
   <div class="right">
+    <a href="https://parallaxadvisory.llc">Parallax Advisory</a>
+    &nbsp;·&nbsp;
     <a href="/login">Customer login</a>
   </div>
 </div>
@@ -788,7 +790,7 @@ app.get('/', async (req, res) => {
 </div>
 
 <footer>
-  Sentinel · a product of Parallax Advisory LLC<br>
+  Sentinel · a product of <a href="https://parallaxadvisory.llc">Parallax Advisory LLC</a><br>
   Sentinel is a monitoring tool, not a security service. Best-effort classification can miss credible threats. Customers retain responsibility for security posture and law-enforcement coordination.
 </footer>
 </body></html>`);

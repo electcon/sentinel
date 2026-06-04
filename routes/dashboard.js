@@ -194,7 +194,7 @@ ${flashBanner}
 <div class="container">
 ${body}
 </div>
-<footer>Sentinel · a product of Parallax Advisory LLC · monitoring tool, not a security service. Best-effort classification can miss credible threats. Customers retain responsibility for security posture and law-enforcement coordination.</footer>
+<footer>Sentinel · a product of <a href="https://parallaxadvisory.llc" style="color:#8b949e;text-decoration:underline">Parallax Advisory LLC</a> · monitoring tool, not a security service. Best-effort classification can miss credible threats. Customers retain responsibility for security posture and law-enforcement coordination.</footer>
 </body></html>`;
 }
 
